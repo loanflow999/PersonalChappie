@@ -1,0 +1,38 @@
+# Local compose file for the board backend.
+#
+# Start:
+#   cp .env.example .env       # set ADMIN_TOKEN!
+#   docker compose up -d --build
+#   curl http://localhost:8765/healthz
+#
+# Multi-arch build (amd64 + arm64):
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#       -t chappie-board-backend:0.1.0 . --push
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chappie-board-backend:0.1.0
+    container_name: chappie-board-backend
+    restart: unless-stopped
+    environment:
+      CHAPPIE_BOARD_ADMIN_TOKEN: ${CHAPPIE_BOARD_ADMIN_TOKEN:?ADMIN_TOKEN is not set — see .env.example}
+      CHAPPIE_BOARD_DB_PATH: /data/board.db
+      CHAPPIE_BOARD_REGISTER_RATE_LIMIT_PER_MINUTE: ${CHAPPIE_BOARD_RATE_LIMIT:-10}
+      CHAPPIE_BOARD_REPLAY_WINDOW_SECONDS: ${CHAPPIE_BOARD_REPLAY_WINDOW:-300}
+    ports:
+      - "${CHAPPIE_BOARD_HOST_PORT:-8765}:8765"
+    volumes:
+      - db_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  db_data:
+    driver: local

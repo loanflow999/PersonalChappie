@@ -1,0 +1,1655 @@
+"""REST surface of the agent society (``/api/society``).
+
+The runtime is built on first use from ``app.state.society_factory`` (set in
+``server.py``), so nothing opens on the boot path (AP-26). Every mutating
+route that starts spend or stops work carries ``x-chappie-dangerous`` so the
+dynamic ``chappie api society …`` CLI layer demands confirmation.
+
+The roster is user content: creating an agent executes nothing and is not
+dangerous; messaging one can trigger a turn (spend) and is; the kill switch
+is dangerous in both directions because releasing it resumes work.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any, Literal
+from uuid import uuid4
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.requests import HTTPConnection
+
+from chappie.brain.assistant_name import DEFAULT_ASSISTANT_NAME, resolve_assistant_name
+from chappie.society.events import MsgType
+from chappie.society.failure_reasons import FailureReason, retry_action
+from chappie.society.memory import MEMORY_SHARE_CAPABILITY, MemoryRefused
+from chappie.society.rooms import RoomError
+from chappie.society.roster import AgentRecord, RosterError
+from chappie.society.runtime import SocietyRuntime, SocietyRuntimeClosed
+
+log = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/society", tags=["society"])
+
+
+# ------------------------------------------------------------------ runtime
+
+
+async def _runtime(request: HTTPConnection) -> SocietyRuntime:
+    state = request.app.state
+    if getattr(state, "society_stopping", False):
+        raise HTTPException(503, "society runtime stopped")
+    runtime = getattr(state, "society", None)
+    if runtime is None:
+        factory = getattr(state, "society_factory", None)
+        if factory is None:
+            raise HTTPException(503, "society runtime not configured")
+        try:
+            runtime = factory()
+        except SocietyRuntimeClosed as exc:
+            raise HTTPException(503, "society runtime stopped") from exc
+        except Exception as exc:  # noqa: BLE001 — surfaces as 503 with the reason in the log
+            log.warning("society: runtime could not be built: %s", exc)
+            raise HTTPException(503, "society runtime unavailable") from exc
+        state.society = runtime
+    try:
+        await runtime.ensure_started()
+    except SocietyRuntimeClosed as exc:
+        raise HTTPException(503, "society runtime stopped") from exc
+    return runtime
+
+
+def _typed_error(exc: RosterError | RoomError) -> HTTPException:
+    reason = exc.reason
+    status = 404 if reason is FailureReason.TARGET_UNKNOWN else 409
+    return HTTPException(
+        status,
+        {"reason": str(reason), "retry": str(retry_action(reason)), "detail": str(exc)},
+    )
+
+
+def _validated_chat_runner(
+    rt: SocietyRuntime,
+    agent: AgentRecord,
+    provider: str,
+    *,
+    approval_mode: str | None = None,
+    permission_ceiling: str | None = None,
+) -> str:
+    """Reject a runner change that cannot honor the effective chat approval."""
+    from chappie.agent_chat.permissions import normalize_permission, society_mode_supported
+    from chappie.agent_chat.service import resolve_runner
+
+    runner = resolve_runner(provider, surface="society")
+    mode = approval_mode if approval_mode is not None else (
+        str(agent.approval_mode) if agent.approval_mode is not None else ""
+    )
+    if mode and not society_mode_supported(runner, mode):
+        raise HTTPException(422, "This runner cannot provide an actionable approval for that mode.")
+    ceiling = str(
+        permission_ceiling if permission_ceiling is not None else agent.permission_ceiling
+    )
+    if not mode and ceiling != "safe" and not society_mode_supported(runner, "ask"):
+        raise HTTPException(
+            422, "This runner cannot provide an actionable approval for this legacy agent."
+        )
+    chat = rt.chat_service()
+    if chat is not None and chat.store.get_session(agent.session_id) is not None:
+        override = chat.store.permission_override(agent.session_id)
+        if override and override not in ("plan", "read-only"):
+            if not society_mode_supported(runner, normalize_permission("society", override)):
+                raise HTTPException(422, "This runner cannot honor the chat's approval choice.")
+    return runner
+
+
+# ------------------------------------------------------------------- models
+
+
+class CreateAgentBody(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    title: str = ""
+    description: str = ""
+    tier: str = "specialist"
+    parent_agent_id: str | None = None
+    provider: str = ""
+    model: str = ""
+    effort: str = ""
+    account_id: str = ""
+    grant_mode: str | None = None
+    grants: list[str] | None = None
+    focus: list[str] | None = None
+    denies: list[str] | None = None
+    skills: list[str] | None = None
+    permission_ceiling: str | None = None
+    approval_mode: str | None = None
+    approval_rules: dict[str, list[str]] | None = None
+    daily_budget_usd: float | None = None
+    max_concurrent_runs: int | None = None
+    avatar: dict[str, Any] | None = None
+    browser_mode: str | None = None
+    browser_allowed_domains: list[str] | None = None
+    #: Where the agent runs: "" = this computer, else a connected computer id.
+    computer_id: str | None = None
+    #: Structured brief (chappie.society.brief); rendered into ``description``.
+    mission: str | None = Field(default=None, max_length=2_000)
+    responsibilities: list[str] | None = None
+    working_rules: list[str] | None = None
+    output_format: str | None = Field(default=None, max_length=2_000)
+    boundaries: list[str] | None = None
+    success_criteria: str | None = Field(default=None, max_length=2_000)
+
+
+class PatchAgentBody(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=40)
+    title: str | None = None
+    description: str | None = None
+    tier: str | None = None
+    parent_agent_id: str | None = None
+    state: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    account_id: str | None = None
+    grant_mode: str | None = None
+    grants: list[str] | None = None
+    focus: list[str] | None = None
+    denies: list[str] | None = None
+    skills: list[str] | None = None
+    knowledge_scope: str | None = None
+    permission_ceiling: str | None = None
+    approval_mode: str | None = None
+    approval_rules: dict[str, list[str]] | None = None
+    daily_budget_usd: float | None = None
+    max_concurrent_runs: int | None = None
+    avatar: dict[str, Any] | None = None
+    checkpoint: str | None = None
+    browser_mode: str | None = None
+    browser_allowed_domains: list[str] | None = None
+    #: Where the agent runs: "" = this computer, else a connected computer id.
+    computer_id: str | None = None
+    #: Structured brief (chappie.society.brief); rendered into ``description``.
+    mission: str | None = Field(default=None, max_length=2_000)
+    responsibilities: list[str] | None = None
+    working_rules: list[str] | None = None
+    output_format: str | None = Field(default=None, max_length=2_000)
+    boundaries: list[str] | None = None
+    success_criteria: str | None = Field(default=None, max_length=2_000)
+
+
+class MessageBody(BaseModel):
+    text: str = Field(min_length=1, max_length=20_000)
+    from_agent: str = "user"
+    msg_type: str = "SAY"
+    trace_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatGroupBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    members: list[str] = Field(min_length=2, max_length=50)
+
+
+class AssignBody(BaseModel):
+    task: str = Field(min_length=1, max_length=20_000)
+    from_agent: str = "user"
+    trace_id: str | None = None
+    lang: str | None = None
+
+
+class CreateQuestBody(BaseModel):
+    text: str = Field(min_length=1, max_length=20_000)
+    title: str = Field(default="", max_length=120)
+    lang: str | None = None
+
+
+class OpenRoomBody(BaseModel):
+    members: list[str] = Field(min_length=2, max_length=6)
+    topic: str = ""
+    opened_by: str = "user"
+
+
+class RoomSayBody(BaseModel):
+    member: str
+    text: str = ""
+
+
+# ------------------------------------------------------------------- agents
+
+
+def _agent_row(agent: AgentRecord, request: HTTPConnection) -> dict[str, Any]:
+    """Serialize an agent; the lead wears the name derived from the wake phrase.
+
+    The roster row keeps its seeded name, but the lead IS the assistant, so every
+    surface (office, roster, chat, CLI) shows what the user calls it. Resolved per
+    request, so a changed wake word shows up without a restart.
+    """
+    row = agent.to_dict()
+    if agent.tier == "lead":
+        config = getattr(request.app.state, "config", None)
+        name = resolve_assistant_name(config) if config is not None else ""
+        if name and name != DEFAULT_ASSISTANT_NAME:
+            row["name"] = name
+    return row
+
+
+@router.get("/agents")
+async def list_agents(request: Request, include_archived: bool = False) -> dict[str, Any]:
+    rt = await _runtime(request)
+    agents = await rt.roster.list(include_archived=include_archived)
+    rows = []
+    for agent in agents:
+        row = _agent_row(agent, request)
+        if agent.state == "paused":
+            row["run_state"] = "paused"
+        elif rt.checkpoints.is_busy(agent.agent_id):
+            # A scheduler run OR a turn typed into the card: both are work.
+            row["run_state"] = "working"
+        else:
+            row["run_state"] = "idle"
+        rows.append(row)
+    return {"agents": rows, "total": len(rows)}
+
+
+async def _creator_from_request(request: Request, rt: SocietyRuntime) -> AgentRecord | None:
+    """The live society agent making this request, or ``None`` for the UI/CLI."""
+    from chappie.society.inherit import caller_session_id, session_agent_id
+
+    session_id = (request.headers.get("x-chappie-chat-session") or "").strip() or caller_session_id()
+    agent_id = session_agent_id(session_id)
+    if not agent_id:
+        return None
+    agent = await rt.roster.get(agent_id)
+    if agent is None or str(agent.state) != "active":
+        return None
+    return agent
+
+
+def _capability_readback(rt: SocietyRuntime, agent: AgentRecord) -> dict[str, Any]:
+    """What the agent can reach, so a spoken confirmation states facts: its
+    focus by label, and focus capabilities whose service is not connected."""
+    try:
+        rows = {row.id: row for row in rt.catalog()}
+    except Exception:  # noqa: BLE001 — the readback is advisory; the save stands
+        log.warning("society: capability readback unavailable", exc_info=True)
+        return {}
+    focus = [rows[cap].label if cap in rows else cap for cap in agent.focus]
+    missing = [rows[cap].label for cap in agent.focus if cap in rows and not rows[cap].connected]
+    readback: dict[str, Any] = {"focus": focus}
+    if missing:
+        readback["not_connected"] = missing
+        readback["hint"] = "Tell the user to connect these in the Marketplace first."
+    return readback
+
+
+@router.post("/agents")
+async def create_agent(body: CreateAgentBody, request: Request) -> dict[str, Any]:
+    from chappie.society.brief import BRIEF_FIELDS, compose_description
+
+    rt = await _runtime(request)
+    fields = body.model_dump(
+        exclude_none=True, exclude={"name", "title", "description", "tier", *BRIEF_FIELDS}
+    )
+    description = compose_description(body.description, body.model_dump(include=set(BRIEF_FIELDS)))
+    creator = await _creator_from_request(request, rt)
+    # Voice has no Society session. Its new agents still inherit the last
+    # explicit chat seat, never the realtime credential or the Tool Model.
+    if not fields.get("provider") and (creator is None or creator.agent_id == rt.lead_id):
+        from .agent_chat_routes import _service_from_state
+
+        svc = _service_from_state(request.app.state)
+        if svc is None and getattr(request.app.state, "agent_chat_factory", None) is not None:
+            raise HTTPException(503, "The saved Chappie chat model is temporarily unavailable")
+        selection = svc.store.chat_selection() if svc is not None else None
+        if selection is not None:
+            for key, value in selection.to_dict().items():
+                if not fields.get(key):
+                    fields[key] = value
+    if creator is not None:
+        from chappie.society.inherit import inherit_creator_fields
+
+        fields = inherit_creator_fields(fields, creator)
+    requested_mode = str(fields.get("approval_mode") or "bypass")
+    provider = str(fields.get("provider") or body.provider)
+    if provider:
+        from chappie.agent_chat.permissions import society_mode_supported
+        from chappie.agent_chat.service import resolve_runner
+
+        if not society_mode_supported(resolve_runner(provider, surface="society"), requested_mode):
+            raise HTTPException(
+                422, "This runner cannot provide an actionable approval for that mode."
+            )
+    derived_focus, derived_rules = rt.derive(body.title, description)
+    if body.focus is None and derived_focus:
+        fields["focus"] = derived_focus
+    if str(fields.get("grant_mode") or "") == "allowlist":
+        allowed = set(fields.get("grants") or [])
+        if allowed and "focus" in fields:
+            fields["focus"] = [cap for cap in fields["focus"] if cap in allowed]
+    if body.approval_rules is None and derived_rules["require_approval"]:
+        fields["approval_rules"] = derived_rules
+    try:
+        agent, created = await rt.roster.create(
+            name=body.name,
+            title=body.title,
+            description=description,
+            tier=body.tier,
+            **fields,
+        )
+    except RosterError as exc:
+        raise _typed_error(exc) from exc
+    return {
+        "agent": agent.to_dict(),
+        "created": created,
+        "readback": _capability_readback(rt, agent),
+    }
+
+
+@router.get("/agents/{agent_id}")
+async def get_agent(agent_id: str, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    events = await rt.store.events_for_agent(agent.agent_id, limit=50)
+    return {
+        "agent": _agent_row(agent, request),
+        "recent_events": [e.model_dump() for e in events],
+        "active_runs": rt.scheduler.active_runs(agent.agent_id),
+    }
+
+
+@router.patch("/agents/{agent_id}")
+async def patch_agent(agent_id: str, body: PatchAgentBody, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    from chappie.society.brief import BRIEF_FIELDS, compose_description, has_brief
+
+    fields = body.model_dump(exclude_none=True, exclude=set(BRIEF_FIELDS))
+    brief = body.model_dump(include=set(BRIEF_FIELDS))
+    if has_brief(brief):
+        # A brief rewrites the standing instructions as a whole.
+        fields["description"] = compose_description(body.description or "", brief)
+    if any(key in fields for key in ("provider", "approval_mode", "permission_ceiling")):
+        _validated_chat_runner(
+            rt,
+            agent,
+            body.provider or agent.provider,
+            approval_mode=body.approval_mode,
+            permission_ceiling=fields.get("permission_ceiling"),
+        )
+    if ("title" in fields or "description" in fields) and "focus" not in fields:
+        # A prose edit must not wipe what the agent earned in its chat: the
+        # derived focus is APPENDED to the existing order (existing first,
+        # deduped) and derived approval rules are written only when the agent
+        # has none — a person editing the description never silently loses the
+        # rules they confirmed on a card.
+        title = fields.get("title", agent.title)
+        description = fields.get("description", agent.description)
+        derived_focus, derived_rules = rt.derive(title, description)
+        merged_focus = list(agent.focus)
+        for cap_id in derived_focus:
+            if cap_id not in merged_focus:
+                merged_focus.append(cap_id)
+        fields["focus"] = merged_focus
+        has_rules = any(agent.approval_rules.get(k) for k in ("require_approval", "always_allow"))
+        if "approval_rules" not in fields and not has_rules and derived_rules["require_approval"]:
+            fields["approval_rules"] = derived_rules
+    try:
+        updated = await rt.roster.update(agent.agent_id, fields)
+    except RosterError as exc:
+        raise _typed_error(exc) from exc
+    if "approval_mode" in fields:
+        svc = rt.chat_service()
+        if (
+            svc is not None
+            and svc.store.get_session(updated.session_id) is not None
+            and not svc.is_running(updated.session_id)
+        ):
+            from chappie.society.chat_binding import ensure_session
+
+            # An active turn keeps its pinned seat. An idle one rebinds through
+            # the roster plus any narrower chat override instead of replacing
+            # that override with the card's new default.
+            ensure_session(svc, rt.config(), updated)
+    if "state" in fields:
+        await rt.checkpoints.refresh(agent.agent_id)
+        updated = await rt.roster.get(agent.agent_id) or updated
+    return {"agent": _agent_row(updated, request), "readback": _capability_readback(rt, updated)}
+
+
+@router.post("/agents/{agent_id}/chat")
+async def bind_agent_chat(agent_id: str, request: Request) -> dict[str, Any]:
+    """The agent's canonical chat (``society:<agent_id>``), created or re-seated
+    to the roster row. Idempotent and free of spend: nothing runs until a
+    message is sent. The model card calls it before it opens the chat column."""
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    svc = rt.chat_service()
+    if svc is None:
+        raise HTTPException(503, "agent chat service unavailable")
+    from chappie.society.chat_binding import ensure_session
+
+    try:
+        session = ensure_session(svc, rt.config(), agent)
+    except PermissionError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"session": session.to_dict(), "agent_id": agent.agent_id}
+
+
+@router.get("/agents/{agent_id}/conversations", openapi_extra={"x-chappie-readonly": True})
+async def agent_conversations(agent_id: str, request: Request) -> dict[str, Any]:
+    """The agent's own chats with Chappie and teammates, newest first.
+
+    Each is ``society:<agent>:with:<counterpart>``: where the agent works on what
+    Chappie or a teammate sent it, kept out of the person's chat with the agent.
+    For Chappie these are the agents' chats with Chappie. Nothing runs or bills.
+    """
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    svc = rt.chat_service()
+    if svc is None:
+        raise HTTPException(503, "agent chat service unavailable")
+    from chappie.society.roster import LEAD_AGENT_ID, PAIR_SESSION_MARKER
+    from chappie.society.surface import agent_id_of, counterpart_of
+
+    if agent.agent_id == LEAD_AGENT_ID:
+        sessions = await asyncio.to_thread(
+            svc.store.list_sessions_matching, "society:", PAIR_SESSION_MARKER + LEAD_AGENT_ID
+        )
+    else:
+        sessions = await asyncio.to_thread(
+            svc.store.list_sessions_matching, agent.session_id + PAIR_SESSION_MARKER
+        )
+    names = {member.agent_id: member.name for member in await rt.roster.list()}
+    rows: list[dict[str, Any]] = []
+    for session in sessions:
+        sid = session.session_id
+        owner_id = agent_id_of(sid) or ""
+        counterpart_id = counterpart_of(sid) or ""
+        other_id = owner_id if agent.agent_id == LEAD_AGENT_ID else counterpart_id
+        row = session.to_dict()
+        row["running"] = svc.is_running(sid)
+        # An approval card or a question waits for the person in this chat.
+        questions = getattr(svc, "pending_questions", None)
+        row["waiting"] = bool(
+            svc.pending_approvals(sid) or (questions(sid) if callable(questions) else [])
+        )
+        row["owner_id"] = owner_id
+        row["counterpart_id"] = other_id
+        row["counterpart_name"] = names.get(other_id, other_id)
+        rows.append(row)
+    return {"agent_id": agent.agent_id, "conversations": rows}
+
+
+@router.delete("/agents/{agent_id}")
+async def archive_agent(agent_id: str, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    try:
+        archived = await rt.roster.archive(agent.agent_id)
+    except RosterError as exc:
+        raise _typed_error(exc) from exc
+    return {"agent": archived.to_dict()}
+
+
+async def _valid_group_members(rt: SocietyRuntime, members: list[str]) -> list[str]:
+    if len(set(members)) != len(members):
+        raise HTTPException(422, "group members must be unique")
+    for member_id in members:
+        agent = await rt.roster.get(member_id)
+        if agent is None or agent.tier == "lead" or agent.state == "archived":
+            raise HTTPException(422, f"agent {member_id} is unavailable for a group")
+    return members
+
+
+@router.get("/chat-groups")
+async def list_chat_groups(request: Request) -> dict[str, Any]:
+    """List persistent Society group chats and their members."""
+    rt = await _runtime(request)
+    return {"groups": await rt.store.list_chat_groups()}
+
+
+@router.post("/chat-groups")
+async def create_chat_group(body: ChatGroupBody, request: Request) -> dict[str, Any]:
+    """Create one group chat from available Society agents."""
+    rt = await _runtime(request)
+    if not body.name.strip():
+        raise HTTPException(422, "group name is required")
+    members = await _valid_group_members(rt, body.members)
+    group = await rt.store.create_chat_group(uuid4().hex, body.name.strip(), members)
+    return {"group": group}
+
+
+@router.patch("/chat-groups/{group_id}")
+async def update_chat_group(group_id: str, body: ChatGroupBody, request: Request) -> dict[str, Any]:
+    """Rename a group chat and replace its member list."""
+    rt = await _runtime(request)
+    if not body.name.strip():
+        raise HTTPException(422, "group name is required")
+    if await rt.store.get_chat_group(group_id) is None:
+        raise HTTPException(404, "chat group not found")
+    members = await _valid_group_members(rt, body.members)
+    return {"group": await rt.store.update_chat_group(group_id, body.name.strip(), members)}
+
+
+@router.delete("/chat-groups/{group_id}", openapi_extra={"x-chappie-dangerous": True})
+async def delete_chat_group(group_id: str, request: Request) -> dict[str, bool]:
+    """Ungroup agents while preserving their individual conversations."""
+    rt = await _runtime(request)
+    if await rt.store.get_chat_group(group_id) is None:
+        raise HTTPException(404, "chat group not found")
+    await rt.store.delete_chat_group(group_id)
+    return {"deleted": True}
+
+
+@router.post("/agents/{agent_id}/message", openapi_extra={"x-chappie-dangerous": True})
+async def message_agent(agent_id: str, body: MessageBody, request: Request) -> dict[str, Any]:
+    """Append a message to the agent (user → agent by default). May start a turn."""
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    try:
+        msg_type = MsgType(body.msg_type)
+    except ValueError as exc:
+        raise HTTPException(422, f"msg_type must be one of {[str(m) for m in MsgType]}") from exc
+    if msg_type in (MsgType.ASSIGN, MsgType.ROOM_OPEN, MsgType.ROOM_SETTLE, MsgType.VETO):
+        raise HTTPException(422, "use /assign or /rooms for that message type")
+    env = await rt.say(
+        from_agent=body.from_agent,
+        to_agent=agent.agent_id,
+        text=body.text,
+        trace_id=body.trace_id,
+        msg_type=msg_type,
+        payload=body.payload,
+    )
+    return {"event": env.model_dump()}
+
+
+@router.post("/agents/{agent_id}/assign", openapi_extra={"x-chappie-dangerous": True})
+async def assign_agent(agent_id: str, body: AssignBody, request: Request) -> dict[str, Any]:
+    """Give the agent a task: an ASSIGN the scheduler turns into real work."""
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    payload: dict[str, Any] = {"text": body.task}
+    if body.lang:
+        payload["lang"] = body.lang
+    env = await rt.say(
+        from_agent=body.from_agent,
+        to_agent=agent.agent_id,
+        text=body.task,
+        trace_id=body.trace_id or f"task:{env_trace_seed()}",
+        msg_type=MsgType.ASSIGN,
+        payload=payload,
+    )
+    outcome = await rt.store.events_for_trace(env.trace_id)
+    verdict = next((e for e in outcome if e.seq and env.seq and e.seq > env.seq), None)
+    return {
+        "event": env.model_dump(),
+        "outcome": verdict.model_dump() if verdict else None,
+    }
+
+
+def env_trace_seed() -> str:
+    from chappie.missions.ids import uuid7_str
+
+    return uuid7_str()
+
+
+@router.post("/agents/{agent_id}/kill", openapi_extra={"x-chappie-dangerous": True})
+async def kill_agent(agent_id: str, request: Request) -> dict[str, Any]:
+    """Pause the agent and drop its run slots (its missions are cancelled when possible)."""
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    dropped = 0
+    manager = rt._get_manager()  # noqa: SLF001 — the route is the runtime's operator
+    for run_id, owner in list(rt.scheduler.running.items()):
+        if owner != agent.agent_id:
+            continue
+        rt.scheduler.note_run_ended(run_id)
+        dropped += 1
+        if manager is not None and hasattr(manager, "cancel"):
+            try:
+                await manager.cancel(run_id)
+            except Exception:  # noqa: BLE001 — already gone is fine
+                log.debug("society kill: mission %s not cancellable", run_id)
+    paused = await rt.roster.update(agent.agent_id, {"state": "paused"})
+    return {"agent": _agent_row(paused, request), "runs_dropped": dropped}
+
+
+# ------------------------------------------------------------------ quests
+
+
+@router.get("/quests")
+async def list_quests(
+    request: Request, state: str | None = None, limit: int = 200
+) -> dict[str, Any]:
+    """The Quest Board: newest first, optionally one state only."""
+    rt = await _runtime(request)
+    quests = await rt.quests.list(state=state or None, limit=max(1, min(int(limit), 1000)))
+    return {"quests": [q.to_dict() for q in quests]}
+
+
+@router.post("/quests", openapi_extra={"x-chappie-dangerous": True})
+async def create_quest(body: CreateQuestBody, request: Request) -> dict[str, Any]:
+    """Post a quest: trusted Python routes it to one agent (forging one when
+    nobody fits) and the scheduler starts the work — this spends."""
+    rt = await _runtime(request)
+    try:
+        quest = await rt.quests.create(body.text, title=body.title, lang=body.lang)
+    except RosterError as exc:
+        raise _typed_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"quest": quest.to_dict()}
+
+
+@router.get("/quests/{quest_id}")
+async def get_quest(quest_id: str, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    quest = await rt.quests.get(quest_id)
+    if quest is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    events = await rt.store.events_for_trace(quest.trace_id)
+    return {"quest": quest.to_dict(), "events": [e.model_dump() for e in events]}
+
+
+@router.post("/quests/{quest_id}/cancel", openapi_extra={"x-chappie-dangerous": True})
+async def cancel_quest(quest_id: str, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    try:
+        quest = await rt.quests.cancel(quest_id)
+    except KeyError as exc:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)}) from exc
+    return {"quest": quest.to_dict()}
+
+
+@router.post("/quests/{quest_id}/retry", openapi_extra={"x-chappie-dangerous": True})
+async def retry_quest(quest_id: str, request: Request) -> dict[str, Any]:
+    """A failed or open quest is routed again (the taker may differ)."""
+    rt = await _runtime(request)
+    try:
+        quest = await rt.quests.retry(quest_id)
+    except KeyError as exc:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)}) from exc
+    except RosterError as exc:
+        raise _typed_error(exc) from exc
+    return {"quest": quest.to_dict()}
+
+
+# ------------------------------------------------------------------- board
+
+
+@router.get("/events")
+async def list_events(
+    request: Request,
+    after_seq: int = 0,
+    trace_id: str | None = None,
+    agent_id: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    rt = await _runtime(request)
+    limit = max(1, min(int(limit), 1000))
+    if trace_id:
+        events = await rt.store.events_for_trace(trace_id)
+    elif agent_id:
+        events = await rt.store.events_for_agent(agent_id, after_seq=after_seq, limit=limit)
+    else:
+        events = await rt.store.events_since(after_seq, limit=limit)
+    return {"events": [e.model_dump() for e in events], "last_seq": await rt.store.last_seq()}
+
+
+@router.get("/agents/{agent_id}/inbox")
+async def agent_inbox(agent_id: str, request: Request, after_seq: int = 0) -> dict[str, Any]:
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    events = await rt.store.inbox_for(agent.agent_id, after_seq=after_seq)
+    return {"events": [e.model_dump() for e in events]}
+
+
+# ------------------------------------------------------------------- seeds
+
+
+@router.get("/seeds")
+async def list_seed_proposals(request: Request) -> dict[str, Any]:
+    """Teammates worth creating on this box — one per connected capability."""
+    from chappie.society.seeds import propose_seeds
+
+    rt = await _runtime(request)
+    taken = {a.name for a in await rt.roster.list(include_archived=True)}
+    proposals = propose_seeds(rt.catalog(), taken)
+    return {"proposals": proposals, "total": len(proposals)}
+
+
+class ApplySeedsBody(BaseModel):
+    names: list[str] = Field(default_factory=list)
+
+
+@router.post("/seeds/apply")
+async def apply_seed_proposals(body: ApplySeedsBody, request: Request) -> dict[str, Any]:
+    """Create the picked proposals (all of them when ``names`` is empty)."""
+    from chappie.society.seeds import create_from_proposals
+
+    rt = await _runtime(request)
+    ids = await create_from_proposals(rt.roster, rt.catalog(), body.names)
+    created = []
+    for agent_id in ids:
+        agent = await rt.roster.get(agent_id)
+        if agent is not None:
+            created.append(agent.to_dict())
+    return {"agents": created, "total": len(created)}
+
+
+# --------------------------------------------------------------- providers
+
+
+class ModelBody(BaseModel):
+    provider: str = Field(min_length=1)
+    model: str = ""
+    effort: str = ""
+    account_id: str = ""
+
+
+@router.get("/providers")
+async def list_society_providers(request: Request) -> dict[str, Any]:
+    """Every provider an agent may run on, with the runner that answers on
+    this box (a vendor CLI = a subscription seat; brain = an API key) and the
+    subscription accounts stored for that CLI. Models, efforts and ladders
+    come from GET /api/agent-chat/catalog?surface=society."""
+    from chappie.agent_chat.catalog import rows_for
+    from chappie.agent_chat.service import resolve_runner
+
+    await _runtime(request)
+    rows = []
+    for row in rows_for("society"):
+        runner = resolve_runner(row.id, surface="society")
+        accounts: list[dict[str, Any]] = []
+        if row.agent:
+            accounts = _account_snapshots(row.agent)
+        rows.append(
+            {
+                "id": row.id,
+                "label": row.label,
+                "family": row.family,
+                "runner": runner,
+                "subscription": runner not in ("brain", "api", "unknown"),
+                "keyless": bool(getattr(row, "keyless", False)),
+                "platform": row.agent or None,
+                "accounts": accounts,
+            }
+        )
+    return {"providers": rows, "catalog": "/api/agent-chat/catalog?surface=society"}
+
+
+def _account_snapshots(platform: str) -> list[dict[str, Any]]:
+    try:
+        from chappie import agent_accounts
+
+        if platform not in agent_accounts.platforms():
+            return []
+        return [s.to_dict() for s in agent_accounts.snapshots(platform)]  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 — no account layer: the picker shows none
+        log.debug("society: account snapshots unavailable for %s", platform, exc_info=True)
+        return []
+
+
+@router.post("/agents/{agent_id}/model")
+async def switch_agent_model(agent_id: str, body: ModelBody, request: Request) -> dict[str, Any]:
+    """Move the agent onto another provider / model / effort / subscription seat.
+    Its canonical chat is re-seated at once (transcript kept)."""
+    from chappie.agent_chat.catalog import offers
+
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    if not offers("society", body.provider):
+        raise HTTPException(
+            422,
+            {"reason": str(FailureReason.BLOCKED_BY_POLICY), "detail": "provider not offered"},
+        )
+    target_runner = _validated_chat_runner(rt, agent, body.provider)
+    chat = rt._get_chat()
+    fields = {
+        "provider": body.provider.strip().lower(),
+        "model": body.model.strip(),
+        "effort": body.effort.strip(),
+        "account_id": body.account_id.strip(),
+    }
+    if chat is not None and hasattr(chat, "controls"):
+        from chappie.society.roster import PAIR_SESSION_MARKER
+
+        # The person's chat and every conversation chat run on the card's seat.
+        matching = getattr(chat.store, "list_sessions_matching", None)
+        owned = [agent.session_id] + [
+            s.session_id
+            for s in (matching(agent.session_id + PAIR_SESSION_MARKER) if matching else [])
+        ]
+        for sid in owned:
+            if chat.store.get_session(sid):
+                await chat.controls.pause(sid, "Model settings changed")
+                await chat.controls._clear_saved_native(sid)
+    try:
+        updated = await rt.roster.update(agent.agent_id, fields)
+    except RosterError as exc:
+        raise _typed_error(exc) from exc
+    reseated = None
+    svc = rt._get_chat()  # noqa: SLF001 — the route is the runtime's operator
+    if svc is not None:
+        from chappie.society.chat_binding import ensure_session
+
+        try:
+            session = ensure_session(svc, rt._get_cfg(), updated)  # noqa: SLF001
+            reseated = session.session_id
+        except PermissionError as exc:
+            log.info("society: %s re-seat deferred: %s", agent.agent_id, exc)
+    return {
+        "agent": _agent_row(updated, request),
+        "runner": target_runner,
+        "reseated": reseated,
+    }
+
+
+# ------------------------------------------------------------------ skills
+
+
+@router.get("/agents/{agent_id}/knowledge")
+async def agent_knowledge(agent_id: str, request: Request) -> dict[str, Any]:
+    """List this agent's current memory, learned skills, working rules and review status."""
+    import asyncio
+    import json
+
+    from chappie.society.knowledge import list_files
+    from chappie.society.working_rules import PREFIX, rules
+
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    files = await asyncio.to_thread(list_files, rt, agent)
+    entries = await asyncio.to_thread(rt.memory.entries, agent)
+    last = await rt.store.get_meta(f"review:last:{agent.agent_id}", "")
+    return {
+        "files": files,
+        "learned_instructions": [e.text[len(PREFIX) :] for e in rules(entries)],
+        "reviews": rt.conversations.review_counts(agent.agent_id),
+        "last_review": json.loads(last) if last else None,
+    }
+
+
+@router.get("/agents/{agent_id}/knowledge/file")
+async def agent_knowledge_file(agent_id: str, request: Request, path: str) -> dict[str, Any]:
+    """Read one current Markdown file from this agent's memory or private skill namespace."""
+    import asyncio
+
+    from chappie.society.knowledge import read_file
+
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    try:
+        return await asyncio.to_thread(read_file, rt, agent, path)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)}) from exc
+
+
+@router.get("/agents/{agent_id}/skills")
+async def list_agent_skills(agent_id: str, request: Request) -> dict[str, Any]:
+    """The agent's own learned skills (active for the agent, drafts for Chappie)."""
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    skills = rt.skills_for(agent.agent_id)
+    return {"skills": skills.summaries(), "root": str(skills.root)}
+
+
+@router.post("/agents/{agent_id}/skills/{slug}/promote")
+async def promote_agent_skill(agent_id: str, slug: str, request: Request) -> dict[str, Any]:
+    """Copy a learned skill into the user's global skills as a DRAFT (AP-15)."""
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    try:
+        target = rt.skills_for(agent.agent_id).promote_to_global(slug)
+    except KeyError as exc:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)}) from exc
+    except FileExistsError as exc:
+        raise HTTPException(409, {"reason": str(FailureReason.BLOCKED_BY_POLICY)}) from exc
+    return {"promoted": str(target), "state": "draft"}
+
+
+# ----------------------------------------------------------------- browser
+
+
+class LoginBody(BaseModel):
+    start_url: str = ""
+
+
+@router.get("/browser/status")
+async def browser_status(request: Request) -> dict[str, Any]:
+    """Is the managed browser environment installed, is an install running."""
+    from chappie.society.browser import install as install_mod
+
+    rt = await _runtime(request)
+    return install_mod.snapshot(rt.data_dir)
+
+
+@router.post("/browser/install")
+async def browser_install(request: Request) -> dict[str, Any]:
+    """One-click install of browser-use into its own environment (background)."""
+    from chappie.society.browser import install as install_mod
+
+    rt = await _runtime(request)
+    ok, message = install_mod.start_install(rt.data_dir)
+    return {"started": ok, "message": message, **install_mod.snapshot(rt.data_dir)}
+
+
+@router.get("/agents/{agent_id}/browser")
+async def agent_browser_status(agent_id: str, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    return rt.browser.status_for(agent)
+
+
+@router.post("/agents/{agent_id}/browser/login", openapi_extra={"x-chappie-dangerous": True})
+async def agent_browser_login(agent_id: str, body: LoginBody, request: Request) -> dict[str, Any]:
+    """Open the agent's browser profile headed so the person can sign in once.
+    Returns when the window is closed, /login/done is called, or 15 minutes pass."""
+    from chappie.society.browser.session import BrowserUnavailable
+
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    try:
+        return await rt.browser.login(agent, start_url=body.start_url)
+    except BrowserUnavailable as exc:
+        raise HTTPException(409, {"reason": str(exc.reason), "detail": str(exc)}) from exc
+
+
+@router.post("/agents/{agent_id}/browser/login/done")
+async def agent_browser_login_done(agent_id: str, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    return {"closed": await rt.browser.end_login(agent.agent_id)}
+
+
+# ----------------------------------------------------------------- catalog
+
+
+@router.get("/capabilities")
+async def list_capabilities(request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    rows = rt.catalog()
+    return {"capabilities": [r.to_dict() for r in rows], "total": len(rows)}
+
+
+# ------------------------------------------------------------------- rooms
+
+
+@router.get("/rooms")
+async def list_rooms(request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    return {"rooms": [r.to_dict() for r in await rt.rooms.list()]}
+
+
+@router.post("/rooms")
+async def open_room(body: OpenRoomBody, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    for member in body.members:
+        if await rt.roster.resolve(member) is None:
+            raise HTTPException(
+                404, {"reason": str(FailureReason.TARGET_UNKNOWN), "member": member}
+            )
+    try:
+        room = await rt.rooms.open(opened_by=body.opened_by, members=body.members, topic=body.topic)
+    except RoomError as exc:
+        raise _typed_error(exc) from exc
+    return {"room": room.to_dict()}
+
+
+@router.post("/rooms/{room_id}/say", openapi_extra={"x-chappie-dangerous": True})
+async def room_say(room_id: str, body: RoomSayBody, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    try:
+        room = await rt.rooms.say(room_id, body.member, body.text)
+    except RoomError as exc:
+        raise _typed_error(exc) from exc
+    return {"room": room.to_dict()}
+
+
+@router.post("/rooms/{room_id}/settle", openapi_extra={"x-chappie-dangerous": True})
+async def room_settle(room_id: str, request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    try:
+        room = await rt.rooms.settle(room_id, reason="user", by="user")
+    except RoomError as exc:
+        raise _typed_error(exc) from exc
+    return {"room": room.to_dict()}
+
+
+# ----------------------------------------------------------------- routines
+
+
+class RoutineBody(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    prompt: str = Field(min_length=1, max_length=16_000)
+    schedule: dict[str, Any] = Field(default_factory=lambda: {"kind": "every"})
+    plugin_grants: list[dict[str, str]] = Field(default_factory=list)
+    announce_on_success: str | None = None
+    parent_task_id: str | None = None
+    # Optional model seat for this routine. Omitted = pin the owner's current
+    # seat at creation; explicit values win. "" on update = follow the owner.
+    provider: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    account_id: str | None = None
+
+
+def _task_store(request: Request) -> Any:
+    store = getattr(request.app.state, "task_store", None)
+    if store is None:
+        raise HTTPException(503, "task store not available")
+    return store
+
+
+@router.get("/agents/{agent_id}/routines")
+async def list_agent_routines(agent_id: str, request: Request) -> dict[str, Any]:
+    from chappie.society.routines import list_routines
+
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    rows = await list_routines(_task_store(request), agent.agent_id)
+    return {"routines": rows, "total": len(rows)}
+
+
+@contextmanager
+def _turn_timezone(request: Request) -> Iterator[None]:
+    """Adopt the zone an in-process app command forwarded for its turn."""
+    from chappie.tasks.context import CLIENT_TIMEZONE_HEADER, client_timezone
+
+    zone = request.headers.get(CLIENT_TIMEZONE_HEADER)
+    if not zone or client_timezone.get():
+        yield
+        return
+    token = client_timezone.set(zone)
+    try:
+        yield
+    finally:
+        client_timezone.reset(token)
+
+
+_TIMEZONE_REQUIRED: dict[str, str] = {
+    "reason": "timezone_required",
+    "message": (
+        "This schedule runs on the user's wall clock but their timezone is unknown. "
+        "Ask for it and pass schedule.timezone as an IANA name such as Europe/Berlin."
+    ),
+}
+
+
+async def _create_routine_for(
+    agent: AgentRecord, body: RoutineBody, request: Request
+) -> dict[str, Any]:
+    """A routine is a task in the Automations scheduler tagged with the agent."""
+    from chappie.society.routines import (
+        MAX_ROUTINES_PER_AGENT,
+        build_task_spec,
+        count_routines,
+        create_routine,
+        is_agent_routine,
+        missing_timezone,
+        next_run_readback,
+    )
+    from chappie.tasks.context import turn_timezone
+
+    store = _task_store(request)
+    if await count_routines(store, agent.agent_id) >= MAX_ROUTINES_PER_AGENT:
+        raise HTTPException(409, {"reason": str(FailureReason.BLOCKED_BY_POLICY)})
+    if missing_timezone(body.schedule):
+        raise HTTPException(422, _TIMEZONE_REQUIRED)
+    parent_spec = None
+    parent_row = None
+    if body.parent_task_id:
+        parent_row = await store.get(body.parent_task_id)
+        if parent_row is None or not is_agent_routine(parent_row, agent.agent_id):
+            raise HTTPException(404, "Parent routine not found")
+        if parent_row["state"] not in ("scheduled", "paused"):
+            raise HTTPException(409, "Wait until the routine is idle before adding a schedule")
+        parent_spec = await store.get_spec(body.parent_task_id)
+    try:
+        spec = build_task_spec(
+            agent,
+            title=body.title,
+            prompt=body.prompt,
+            schedule=body.schedule,
+            plugin_grants=body.plugin_grants,
+            announce_on_success=body.announce_on_success,
+            provider=body.provider,
+            model=body.model,
+            effort=body.effort,
+            account_id=body.account_id,
+        )
+        if parent_spec is not None:
+            if spec.trigger.type not in ("calendar", "cron", "every"):
+                raise ValueError("Additional schedules must use a recurring time trigger")
+            # Additional timings keep the existing action, grants, and identity.
+            group_tag = next(
+                (tag for tag in parent_spec.tags if tag.startswith("routine-group:")),
+                f"routine-group:{parent_spec.id}",
+            )
+            spec = parent_spec.model_copy(
+                update={
+                    "id": spec.id,
+                    "created_at_ns": spec.created_at_ns,
+                    "trigger": spec.trigger,
+                    "tags": tuple(
+                        tag for tag in parent_spec.tags if not tag.startswith("routine-group:")
+                    )
+                    + (group_tag,),
+                }
+            )
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(422, f"invalid routine: {exc}") from exc
+    try:
+        if parent_row is not None and parent_row["state"] == "paused":
+            # Never register an inactive routine, even briefly, with the scheduler.
+            task_id = str(await store.insert(spec))
+            await store.update_state(task_id, "paused")
+        else:
+            task_id = await create_routine(
+                store, getattr(request.app.state, "task_scheduler", None), spec
+            )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    seat = (
+        {
+            "provider": spec.action.provider,
+            "model": spec.action.model,
+            "effort": spec.action.effort,
+            "account_id": spec.action.account_id,
+        }
+        if spec.action.kind == "agent"
+        else None
+    )
+    row = await store.get(task_id) or {}
+    zone = getattr(spec.trigger, "timezone", None) or turn_timezone()
+    return {
+        "id": task_id,
+        "title": spec.title,
+        "tags": list(spec.tags),
+        "seat": seat,
+        "state": row.get("state"),
+        "next_run": next_run_readback(row.get("due_at_ns"), zone),
+    }
+
+
+@router.post("/agents/{agent_id}/routines", openapi_extra={"x-chappie-dangerous": True})
+async def create_agent_routine(
+    agent_id: str, body: RoutineBody, request: Request
+) -> dict[str, Any]:
+    """A routine is a task in the Automations scheduler tagged with the agent."""
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    with _turn_timezone(request):
+        return await _create_routine_for(agent, body, request)
+
+
+class RoutineOperationBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operation: Literal["pause", "resume", "delete", "run"]
+
+
+@router.post(
+    "/agents/{agent_id}/routines/{task_id}/operation",
+    openapi_extra={"x-chappie-dangerous": True},
+)
+async def operate_agent_routine(
+    agent_id: str, task_id: str, body: RoutineOperationBody, request: Request
+) -> dict[str, Any]:
+    """Pause, resume, delete or run-now one of the agent's own routines."""
+    from chappie.society.routines import is_agent_routine, manage_routine
+    from chappie.tasks.scheduler import TaskNotFound, TaskStateConflict
+
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    store = _task_store(request)
+    row = await store.get(task_id)
+    if agent is None or row is None or not is_agent_routine(row, agent.agent_id):
+        raise HTTPException(404, "Routine not found")
+    scheduler = getattr(request.app.state, "task_scheduler", None)
+    if scheduler is None:
+        raise HTTPException(503, "The task scheduler is unavailable")
+    if body.operation == "run" and row.get("state") == "running":
+        raise HTTPException(409, "The routine is already running")
+    try:
+        if body.operation == "run":
+            await scheduler.run_now(task_id)
+        else:
+            await manage_routine(
+                agent, {"task_id": task_id, "operation": body.operation}, store, scheduler
+            )
+    except TaskNotFound as exc:
+        raise HTTPException(404, "Routine not found") from exc
+    except TaskStateConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if body.operation == "delete":
+        return {"ok": True, "id": task_id, "operation": "delete", "state": "deleted"}
+    after = await store.get(task_id) or {}
+    return {"ok": True, "id": task_id, "operation": body.operation, "state": after.get("state")}
+
+
+class RoutineUpdateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=200)
+    prompt: str = Field(min_length=1, max_length=16_000)
+    schedule: dict[str, Any]
+    provider: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    account_id: str | None = None
+
+
+@router.patch("/agents/{agent_id}/routines/{task_id}")
+async def update_agent_routine(
+    agent_id: str, task_id: str, body: RoutineUpdateBody, request: Request
+) -> dict[str, Any]:
+    """Edit an agent's routine without losing its identity or execution history."""
+    from chappie.society.routines import is_agent_routine, manage_routine
+    from chappie.tasks.scheduler import TaskNotFound, TaskStateConflict
+
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(agent_id)
+    store = _task_store(request)
+    row = await store.get(task_id)
+    if agent is None or row is None or not is_agent_routine(row, agent.agent_id):
+        raise HTTPException(404, "Routine not found")
+    scheduler = getattr(request.app.state, "task_scheduler", None)
+    if scheduler is None:
+        raise HTTPException(503, "The task scheduler is unavailable")
+    try:
+        await manage_routine(
+            agent,
+            {**body.model_dump(), "task_id": task_id, "operation": "update"},
+            store,
+            scheduler,
+        )
+    except TaskNotFound as exc:
+        raise HTTPException(404, "Routine not found") from exc
+    except TaskStateConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"ok": True, "id": task_id}
+
+
+# ---------------------------------------------------------------- approvals
+
+
+class ResolveApprovalBody(BaseModel):
+    approve: bool
+    note: str = ""
+
+
+class EnqueueApprovalBody(BaseModel):
+    agent_id: str
+    capability: str
+    trace_id: str = ""
+    action: dict[str, Any] = Field(default_factory=dict)
+    summary: str = ""
+
+
+@router.post("/approvals")
+async def enqueue_approval(body: EnqueueApprovalBody, request: Request) -> dict[str, Any]:
+    """Park an action for the person to decide. Executes nothing by itself —
+    the approved action is run by whoever asked (executor, routine, CLI)."""
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(body.agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    item = await rt.approvals.enqueue(
+        agent_id=agent.agent_id,
+        trace_id=body.trace_id or f"approval:{agent.agent_id}",
+        capability=body.capability,
+        action=body.action,
+        summary=body.summary or body.capability,
+    )
+    return {"approval": item.to_dict()}
+
+
+@router.get("/approvals")
+async def list_approvals(request: Request, agent_id: str | None = None) -> dict[str, Any]:
+    """Everything a person still has to decide (pending and parked), oldest first."""
+    rt = await _runtime(request)
+    await rt.approvals.expire_due()
+    items = await rt.approvals.pending()
+    if agent_id:
+        items = [a for a in items if a.agent_id == agent_id]
+    return {"approvals": [a.to_dict() for a in items], "total": len(items)}
+
+
+@router.post("/approvals/{approval_id}/resolve", openapi_extra={"x-chappie-dangerous": True})
+async def resolve_approval(
+    approval_id: str, body: ResolveApprovalBody, request: Request
+) -> dict[str, Any]:
+    """Resolve an approval; denying a live browser action also stops its owning chat."""
+    from chappie.society.proposals import kind_of
+
+    rt = await _runtime(request)
+    current = await rt.approvals.get(approval_id)
+    if current is not None and kind_of(current.capability) is not None:
+        # A configuration proposal is applied by ITS route, never by this one:
+        # confirming here would flip the row without changing the agent.
+        raise HTTPException(
+            409,
+            {
+                "reason": str(FailureReason.BLOCKED_BY_POLICY),
+                "detail": f"use POST /api/society/proposals/{approval_id}/resolve",
+            },
+        )
+    if (
+        current is not None
+        and not body.approve
+        and str(current.state) == "pending"
+        and current.capability == "core:browser"
+        and current.action.get("resume_in_place")
+    ):
+        # A denied browser action must not release the parent planner to try
+        # the same operation through a desktop or shell tool. Signal before
+        # resolving the approval, while the live ownership still identifies
+        # this exact turn. An old approval cannot stop a newer/unrelated chat.
+        live = getattr(getattr(rt, "browser", None), "live", None)
+        session = getattr(live, "sessions", {}).get(current.agent_id)
+        chat = getattr(request.app.state, "agent_chat", None)
+        if (
+            session is not None
+            and current.trace_id
+            and session.active_trace == current.trace_id
+            and session.active_chat
+            and session.run_lock.locked()
+            and chat is not None
+        ):
+            chat.signal_cancel(session.active_chat)
+    try:
+        item = await rt.approvals.resolve(approval_id, approve=body.approve, note=body.note)
+    except KeyError as exc:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)}) from exc
+    promoted: str | None = None
+    if body.approve and item.capability == MEMORY_SHARE_CAPABILITY:
+        knowledge_id = int(item.action.get("knowledge_id") or 0)
+        try:
+            promoted = await rt.memory.promote(knowledge_id)
+        except MemoryRefused as exc:
+            raise HTTPException(409, {"reason": "blocked_by_policy", "detail": str(exc)}) from exc
+    return {"approval": item.to_dict(), "promoted": promoted}
+
+
+@router.post("/approvals/resurface")
+async def resurface_approvals(request: Request) -> dict[str, Any]:
+    """App focus / voice turn: parked items are asked again."""
+    rt = await _runtime(request)
+    revived = await rt.approvals.resurface()
+    return {"approvals": [a.to_dict() for a in revived], "total": len(revived)}
+
+
+# ---------------------------------------------------------------- proposals
+
+
+class ResolveProposalBody(BaseModel):
+    approve: bool
+    note: str = ""
+
+
+@router.get("/proposals")
+async def list_proposals(request: Request, agent_id: str | None = None) -> dict[str, Any]:
+    """Configuration proposals still waiting for the person (agent-definition §3.5)."""
+    from chappie.society.proposals import kind_of
+
+    rt = await _runtime(request)
+    await rt.approvals.expire_due()
+    items = [a for a in await rt.approvals.pending() if kind_of(a.capability) is not None]
+    if agent_id:
+        items = [a for a in items if a.agent_id == agent_id]
+    return {"proposals": [a.to_dict() for a in items], "total": len(items)}
+
+
+@router.post("/onboarding/start")
+async def start_onboarding(request: Request) -> dict[str, Any]:
+    """Offer a team ONCE, in the lead's own chat.
+
+    The lead asks which tools the person uses and proposes the teammates the
+    connected capabilities suggest — as one ``team`` proposal card the person
+    confirms with the names they want. A no-op when the offer was already made
+    or the roster already has teammates; the flag is set as soon as the offer
+    goes out, so an unanswered card is never re-sent.
+    """
+    from chappie.society import proposals
+    from chappie.society.roster import LEAD_AGENT_ID
+    from chappie.society.seeds import ONBOARDING_KEY, onboarding_done, propose_seeds
+
+    rt = await _runtime(request)
+    if await onboarding_done(rt.store):
+        return {"offered": False, "reason": "already_offered"}
+    roster = await rt.roster.list(include_archived=True)
+    if len(roster) > 1:
+        await rt.store.set_meta(ONBOARDING_KEY, "1")
+        return {"offered": False, "reason": "roster_not_empty"}
+    lead = await rt.roster.get(LEAD_AGENT_ID)
+    if lead is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    candidates = propose_seeds(rt.catalog(), {a.name for a in roster})
+    if not candidates:
+        await rt.store.set_meta(ONBOARDING_KEY, "1")
+        return {"offered": False, "reason": "nothing_connected"}
+    try:
+        item = await proposals.propose(
+            rt,
+            lead,
+            kind="team",
+            payload={
+                "names": [c["name"] for c in candidates],
+                "proposals": [
+                    {"name": c["name"], "title": c["title"], "reason": c.get("reason", "")}
+                    for c in candidates
+                ],
+            },
+            reason=(
+                "These teammates fit the tools you already have connected. "
+                "Pick the ones you want; you can add more at any time."
+            ),
+            session_id=lead.session_id,
+        )
+    except proposals.ProposalRefused as exc:
+        raise HTTPException(409, {"reason": str(exc.reason), "detail": exc.detail}) from exc
+    await rt.store.set_meta(ONBOARDING_KEY, "1")
+    return {"offered": True, "proposal": item.to_dict()}
+
+
+@router.post("/proposals/{proposal_id}/resolve", openapi_extra={"x-chappie-dangerous": True})
+async def resolve_proposal(
+    proposal_id: str, body: ResolveProposalBody, request: Request
+) -> dict[str, Any]:
+    """The person decided on the card: a yes APPLIES the change (rule, focus,
+    approval rules, routine, skill, team), a no changes nothing."""
+    from chappie.society import proposals
+
+    rt = await _runtime(request)
+    try:
+        return await proposals.resolve(
+            rt,
+            proposal_id,
+            approve=body.approve,
+            note=body.note,
+            task_store=getattr(request.app.state, "task_store", None),
+            scheduler=getattr(request.app.state, "task_scheduler", None),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)}) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            409, {"reason": str(FailureReason.BLOCKED_BY_POLICY), "detail": str(exc)}
+        ) from exc
+
+
+# ------------------------------------------------------------------- memory
+
+
+class RecallBody(BaseModel):
+    query: str = Field(min_length=1, max_length=400)
+    agent_id: str = "chappie"
+    k: int = Field(default=8, ge=1, le=20)
+
+
+@router.get("/memory")
+async def memory_overview(request: Request) -> dict[str, Any]:
+    """What the Memory House shows: shared topics, every agent's memory head, the review queue."""
+    rt = await _runtime(request)
+    return await rt.memory.overview()
+
+
+@router.post("/memory/recall")
+async def memory_recall(body: RecallBody, request: Request) -> dict[str, Any]:
+    """A lookup as the given agent would see it (scope labels included). Read-only."""
+    rt = await _runtime(request)
+    agent = await rt.roster.resolve(body.agent_id)
+    if agent is None:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    hits = await rt.memory.recall(agent, body.query, k=body.k)
+    return {"hits": [h.to_dict() for h in hits], "total": len(hits)}
+
+
+@router.post("/memory/{knowledge_id}/promote", openapi_extra={"x-chappie-dangerous": True})
+async def memory_promote(knowledge_id: int, request: Request) -> dict[str, Any]:
+    """Copy a staged agent page into society/shared/ as reviewed team knowledge."""
+    rt = await _runtime(request)
+    try:
+        path = await rt.memory.promote(knowledge_id)
+    except MemoryRefused as exc:
+        raise HTTPException(
+            404, {"reason": str(FailureReason.TARGET_UNKNOWN), "detail": str(exc)}
+        ) from exc
+    return {"path": path, "reviewed": True}
+
+
+@router.post("/memory/{knowledge_id}/dismiss")
+async def memory_dismiss(knowledge_id: int, request: Request) -> dict[str, Any]:
+    """Mark a staged page reviewed without promotion; it stays in the agent's own folder."""
+    rt = await _runtime(request)
+    try:
+        await rt.memory.dismiss(knowledge_id)
+    except MemoryRefused as exc:
+        raise HTTPException(
+            404, {"reason": str(FailureReason.TARGET_UNKNOWN), "detail": str(exc)}
+        ) from exc
+    return {"id": knowledge_id, "reviewed": True}
+
+
+@router.get("/memory/file")
+async def memory_file(request: Request, path: str = "") -> dict[str, Any]:
+    """Read one society memory file for the Updating Memory editor.
+
+    Sandboxed to ``society/`` inside the vault: ``memory.md`` per agent and
+    the agent's dated notes. Shared pages are readable, everything outside
+    ``society/`` is refused. The editor shows the file and scrolls to the
+    change the chat's red/green diff describes.
+    """
+    from pathlib import Path
+
+    rt = await _runtime(request)
+    rel = str(path or "").strip().replace("\\", "/").lstrip("/")
+    if not rel.startswith("society/") or ".." in rel.split("/"):
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    if not rel.endswith(".md"):
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    vault = rt.memory.root()
+    target = vault / rel
+    parts = rel.split("/")
+    if len(parts) == 3 and parts[-1].lower() in {"memory.md", "user.md"}:
+        import asyncio
+
+        agent = await rt.roster.get(parts[1])
+        if agent is not None:
+            books = await asyncio.to_thread(rt.memory.books, agent)
+            target = books["user" if parts[-1].lower() == "user.md" else "memory"]
+            rel = target.relative_to(vault.resolve()).as_posix()
+    try:
+        base = (vault / "society").resolve()
+        resolved = target.resolve()
+        if base != resolved and base not in resolved.parents:
+            raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — unreadable path reads as missing
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)}) from exc
+    if not target.is_file():
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)})
+    try:
+        content = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(404, {"reason": str(FailureReason.TARGET_UNKNOWN)}) from exc
+    if len(content) > 200_000:
+        content = content[-200_000:]
+    try:
+        updated_ms = int(target.stat().st_mtime * 1000)
+    except OSError:  # Missing source metadata uses an unknown update timestamp.
+        updated_ms = 0
+    parts = Path(rel).parts
+    agent_id = parts[1] if len(parts) >= 3 else ""
+    return {
+        "path": rel,
+        "agent_id": agent_id,
+        "content": content,
+        "updated_ms": updated_ms,
+    }
+
+
+# ----------------------------------------------------------------- controls
+
+
+@router.get("/status")
+async def society_status(request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    return await rt.status()
+
+
+@router.post("/kill-switch", openapi_extra={"x-chappie-dangerous": True})
+async def engage_kill_switch(request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    return await rt.engage_kill_switch()
+
+
+@router.post("/kill-switch/release", openapi_extra={"x-chappie-dangerous": True})
+async def release_kill_switch(request: Request) -> dict[str, Any]:
+    rt = await _runtime(request)
+    return await rt.release_kill_switch()

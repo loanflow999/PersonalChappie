@@ -1,0 +1,78 @@
+"""Static metadata for the first-time onboarding guide.
+
+Single source of truth for the shipped Terms version, the canonical step
+order, and the informational trademark reference links shown on the
+wake-word step. There is deliberately NO denylist — the user chooses any
+activation word and self-certifies responsibility (see docs/legal/TERMS.md).
+"""
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+CURRENT_TERMS_VERSION = "1.0"
+
+# Canonical step order — must match SETUP_STEP_IDS in the frontend
+# (components/onboarding/setup/setupSteps.ts). Setup runs INSIDE the real app:
+# each step opens the app's own place for the job (the API Keys page and its
+# Agents tab, the wake-word group in Settings) and points at it. The tour of the app runs
+# AFTER the completion restart and is tracked separately
+# (``tour_completed_at`` in chappie.setup.state).
+# Restart batching (maintainer mandate 2026-07-18): voice sits LAST, directly
+# before ready, because it only takes full effect after a relaunch — and
+# onboarding already ends with one unconditional fresh restart
+# (onboarding_routes._schedule_fresh_restart).
+# "how" (2026-10-01) is an interactive explainer of what the assistant is and
+# how its parts connect, shown before anything is set up — new users went
+# through setup without understanding the product.
+# There is NO permissions step (just-in-time permissions, AP-35): nothing asks
+# macOS for anything during first run except where a switch IS the gesture (the
+# wake-word switch on the voice step asks for the microphone there, and says so
+# inside the spotlight hole). A stored legacy step id "permissions" resumes at
+# "voice" (frontend ``resumeStep``); the backend never validates the stored id.
+ONBOARDING_STEPS: list[str] = [
+    "welcome",
+    "how",
+    "keys",
+    "subscriptions",
+    "voice",
+    "ready",
+]
+
+# Informational only; not exhaustive and possibly out of date (stated in the UI).
+WAKE_WORD_LEGAL_REFERENCES: list[dict[str, str]] = [
+    {"label": "EUIPO trademark search (EU)", "url": "https://euipo.europa.eu/eSearch/"},
+    {"label": "USPTO trademark search (US)", "url": "https://www.uspto.gov/trademarks/search"},
+    {"label": "WIPO Global Brand Database", "url": "https://branddb.wipo.int/"},
+    {"label": "DPMA register (Germany)", "url": "https://register.dpma.de/"},
+]
+
+# docs/legal/TERMS.md relative to the repo root (this file: chappie/setup/onboarding_meta.py).
+_TERMS_PATH = Path(__file__).resolve().parents[2] / "docs" / "legal" / "TERMS.md"
+
+_TERMS_FALLBACK = (
+    "Personal Chappie — Terms of Use & Disclaimer (v1.0)\n\n"
+    "This software is provided free and open-source, \"as is\", without warranty. "
+    "You are solely responsible for how you use it, including your choice of activation "
+    "word and compliance with applicable trademark law. Not affiliated with any rights "
+    "holder. The terms document could not be loaded from disk."
+)
+
+
+def read_terms_text() -> str:
+    """Return the canonical English Terms text. Best-effort: never raises."""
+    try:
+        return _TERMS_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("read_terms_text: cannot read %s: %s", _TERMS_PATH, exc)
+        return _TERMS_FALLBACK
+
+
+__all__ = [
+    "CURRENT_TERMS_VERSION",
+    "ONBOARDING_STEPS",
+    "WAKE_WORD_LEGAL_REFERENCES",
+    "read_terms_text",
+]

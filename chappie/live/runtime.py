@@ -1,0 +1,135 @@
+"""Browser media ownership shared by desktop wake, hotkeys and web controls."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+_active: dict[str, Any] = {}
+_owners: dict[str, asyncio.AbstractEventLoop] = {}
+_opening: set[str] = set()
+_watchers: set[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = set()
+_detached: set[asyncio.Task] = set()
+
+
+def retain_work(jobs: tuple[asyncio.Task, ...], ledger: Any) -> None:
+    """Already-started tools may finish after speech closes; retain their receipts."""
+
+    async def finish() -> None:
+        try:
+            await asyncio.gather(*jobs, return_exceptions=True)
+        finally:
+            await asyncio.to_thread(ledger.close)
+
+    task = asyncio.create_task(finish(), name="live-detached-work")
+    _detached.add(task)
+    task.add_done_callback(_detached.discard)
+
+
+def _notify() -> None:
+    for loop, event in tuple(_watchers):
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(event.set)
+
+
+def claim(session_id: str) -> None:
+    if _opening or _active:
+        raise RuntimeError("A voice session is already active in another window.")
+    _opening.add(session_id)
+
+
+def register(session: Any) -> None:
+    _opening.discard(session.session_id)
+    _active[session.session_id] = session
+    _owners[session.session_id] = asyncio.get_running_loop()
+    _notify()
+
+
+def unregister(session_id: str) -> None:
+    _opening.discard(session_id)
+    _active.pop(session_id, None)
+    _owners.pop(session_id, None)
+    _notify()
+
+
+def active() -> tuple[Any, ...]:
+    return tuple(_active.values())
+
+
+async def on_session_loop(session: Any, operation: Any, **kwargs: Any) -> Any:
+    """Execute an active browser session operation on its owning event loop."""
+    owner = _owners.get(session.session_id)
+    if owner is None or not owner.is_running() or owner.is_closed():
+        raise RuntimeError("The browser voice session is no longer available.")
+
+    async def invoke() -> Any:
+        if _active.get(session.session_id) is not session:
+            raise RuntimeError("The browser voice session changed before delivery.")
+        return await operation(**kwargs)
+
+    if asyncio.get_running_loop() is owner:
+        return await invoke()
+    future = asyncio.run_coroutine_threadsafe(invoke(), owner)
+    return await asyncio.wrap_future(future)
+
+
+def owns_microphone(*, except_session_id: str | None = None) -> bool:
+    """A pending or active browser call must not be replaced by a wake start."""
+    return any(sid != except_session_id for sid in (*_opening, *_active))
+
+
+async def close_all(reason: str = "hotkey") -> None:
+    await asyncio.gather(
+        *(on_session_loop(session, session.end, reason=reason) for session in active())
+    )
+
+
+async def run_browser_call(
+    bus: Any,
+    hangup: asyncio.Event,
+    *,
+    timeout_s: float = 45.0,
+    input_buffer: Any = None,
+    session_id: str = "",
+) -> str:
+    """Wake hands media to the WebView; the desktop never feeds speaker echo back."""
+    from chappie.core.events import BrowserVoiceRequested
+    from chappie.live import startup
+
+    changed = asyncio.Event()
+    watcher = (asyncio.get_running_loop(), changed)
+    _watchers.add(watcher)
+
+    async def wait_change() -> None:
+        tasks = [asyncio.create_task(changed.wait()), asyncio.create_task(hangup.wait())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        changed.clear()
+
+    try:
+        if hangup.is_set():
+            return "hotkey"
+        if input_buffer is not None and session_id:
+            startup.offer(session_id, input_buffer)
+        await bus.publish(BrowserVoiceRequested(action="start"))
+        # UI permission and device setup can take time. No idle billed connection.
+        async with asyncio.timeout(timeout_s):
+            while not active() and not hangup.is_set():
+                await wait_change()
+        while active() and not hangup.is_set():
+            await wait_change()
+    except TimeoutError:
+        # The caller receives an explicit error outcome for this bounded wait.
+        return "error"
+    finally:
+        startup.discard(session_id)
+        _watchers.discard(watcher)
+        # Retract pending browser starts on timeout/cancellation too. Otherwise
+        # focusing a hidden window later starts a call whose owner already left.
+        await bus.publish(BrowserVoiceRequested(action="stop"))
+        await close_all()
+    return "hotkey" if hangup.is_set() else "client_stop"
