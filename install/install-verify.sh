@@ -281,14 +281,14 @@ err()  { printf '%s%s%s\n' "${RED}"    "$*" "${RESET}" >&2; }
 # that is how the historical "Harvis" typo crept in.
 cat <<EOF
 
-${GOLD_HI}     ██╗ █████╗ ██████╗ ██╗   ██╗██╗███████╗${RESET}
-${GOLD_HI}     ██║██╔══██╗██╔══██╗██║   ██║██║██╔════╝${RESET}
-${GOLD}     ██║███████║██████╔╝██║   ██║██║███████╗${RESET}
-${GOLD}██   ██║██╔══██║██╔══██╗╚██╗ ██╔╝██║╚════██║${RESET}
-${GOLD_DEEP}╚█████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║███████║${RESET}
-${GOLD_DEEP} ╚════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝${RESET}
+${GOLD_HI} ██████╗ ██╗  ██╗  █████╗  ██████╗  ██████╗  ██╗ ███████╗${RESET}
+${GOLD_HI}██╔════╝ ██║  ██║ ██╔══██╗ ██╔══██╗ ██╔══██╗ ██║ ██╔════╝${RESET}
+${GOLD}██║      ███████║ ███████║ ██████╔╝ ██████╔╝ ██║ █████╗  ${RESET}
+${GOLD}██║      ██╔══██║ ██╔══██║ ██╔═══╝  ██╔═══╝  ██║ ██╔══╝  ${RESET}
+${GOLD_DEEP}╚██████╗ ██║  ██║ ██║  ██║ ██║      ██║      ██║ ███████╗${RESET}
+${GOLD_DEEP} ╚═════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝      ╚═╝      ╚═╝ ╚══════╝${RESET}
 
-${DIM}     P E R S O N A L  J A R V I S   ·   talk to your computer${RESET}
+${DIM}     P E R S O N A L  C H A P P I E   ·   talk to your computer${RESET}
 
 ${GOLD}  ●${RESET} ${BOLD}Verifying installer · macOS / Linux${RESET}
 ${DIM}  Sigstore + offline ceremony + SLSA L3 + ML-DSA-65 (Wave 3)${RESET}
