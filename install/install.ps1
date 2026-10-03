@@ -1,26 +1,13 @@
-# Personal Chappie - Windows quick-install bootstrap (Stage 1)
+# Personal Chappie - Windows installer bootstrap (Stage 1)
 #
 # Usage (from PowerShell):
-#   irm https://raw.githubusercontent.com/PersonalChappie/PersonalChappie/main/install/install.ps1 | iex
+#   & '.\install\install.ps1'
 #
-# This bootstrap is intentionally small. It:
+# Process:
 #   1. Verifies Python 3.11+ and git are available.
-#   2. Offers to install either missing prerequisite, then re-checks in place.
-#   3. Checks for Node.js 18+ (optional - a missing Node never blocks the install).
-#   4. Clones (or updates) personal-chappie into ~\.personal-chappie.
-#   5. Creates a Python venv, installs `rich` + `packaging`.
-#   6. Hands control to install/installer.py (the Stage 2 orchestrator).
-#
-# All heavy logic lives in installer.py so it can be unit-tested and
-# kept cross-platform. The shell-native prerequisite block is delimited so it
-# can be tested directly even on machines where Python is not installed yet.
-#
-# SOURCE-ENCODING RULE: this file is served BOM-less (a BOM breaks
-# `irm | iex`), and Windows PowerShell then reads it as cp1252. So the
-# source OUTSIDE the banner here-string stays pure ASCII: the glyphs (bullet,
-# check, cross) are built from code points at runtime, never pasted as
-# literals -- a literal check/dash would cp1252-decode into a smart quote and
-# break tokenizing. Console output is forced to UTF-8 so they still render.
+#   2. Verifies local repository files.
+#   3. Sets up Python virtual environment (.venv) and installs bootstrap packages.
+#   4. Hands control to install/installer.py (Stage 2: dependencies, voice models, finish).
 
 $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
@@ -195,18 +182,10 @@ function Write-Err([string]$Text)    { Write-Host "$Gut  $Red$Crs $Text$Rst" }
 Write-Banner
 
 # ----------------------------------------------------------------- config
-# Standalone bootstrap projections of chappie/core/branding.py. The branding
-# contract test rejects drift because this script runs before Python is installed.
-$OfficialRepoSlug = "$env:CHAPPIE_OFFICIAL_REPO_SLUG"
-if (-not $OfficialRepoSlug) { $OfficialRepoSlug = 'PersonalChappie/PersonalChappie' }
-if ($OfficialRepoSlug -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
-    throw 'CHAPPIE_OFFICIAL_REPO_SLUG must be an exact owner/repository slug'
-}
-$RepoUrl    = if ($env:CHAPPIE_INSTALL_REPO) { $env:CHAPPIE_INSTALL_REPO } else { "https://github.com/$OfficialRepoSlug.git" }
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
+$InstallDir = if ($env:CHAPPIE_INSTALL_DIR) { $env:CHAPPIE_INSTALL_DIR } else { $RepoRoot }
 $ConfigFileName = 'chappie.toml'
-$Branch     = if ($env:CHAPPIE_INSTALL_REF)  { $env:CHAPPIE_INSTALL_REF }  else { 'main' }
-$InstallDir = if ($env:CHAPPIE_INSTALL_DIR)  { $env:CHAPPIE_INSTALL_DIR }  else { Join-Path $env:USERPROFILE '.personal-chappie' }
-$PrerequisiteMode = if ($env:CHAPPIE_INSTALL_PREREQS) { $env:CHAPPIE_INSTALL_PREREQS.ToLowerInvariant() } else { 'ask' }
 $InitialPath = $env:Path
 
 # Forward any extra args to installer.py (e.g. --no-launch, --dry-run, --with-voice-local)
@@ -536,242 +515,17 @@ if ($ExtraArgs -contains '--headless') {
     }
 }
 
-# ----------------------------------------------------------------- clone / update
-Write-Phase '2/6' 'Fetching Personal Chappie'
-Write-Note $InstallDir
+# ----------------------------------------------------------------- local repository
+Write-Phase '2/6' 'Verifying Local Repository'
+Write-Note "Workspace: $InstallDir"
 
-# On an interactive console, git paints its own "Receiving objects: NN%"
-# progress (on stderr) so a slow download never looks hung (maintainer
-# report 2026-07-15); a redirected/CI run keeps --quiet for a clean
-# transcript. Real errors still surface on stderr either way.
-$GitVerbosity = if ([Console]::IsErrorRedirected) { '--quiet' } else { '--progress' }
-
-# The payload is a single ~80 MB stream and git cannot resume a clone, so a
-# flaky network kills installs two ways (maintainer's Mac, 2026-07-18:
-# "Receiving objects: 45%" frozen for minutes, then "early EOF" /
-# "unexpected disconnect while reading sideband packet"):
-#   1. a stalled stream hangs silently -> low-speed limits turn that into a
-#      fast, visible failure (under 1 KB/s for 30 s = dead connection);
-#   2. a mid-transfer disconnect aborts the install -> retry a clean clone
-#      up to 3 times before giving up with an honest message.
-$GitNetOpts = @('-c', 'http.lowSpeedLimit=1024', '-c', 'http.lowSpeedTime=30')
-
-function Invoke-CloneWithRetry {
-    Write-Note 'downloading ~80 MB - a few minutes on slow connections'
-    $Attempt = 1
-    while ($true) {
-        # Attempt 1 uses git's default transport; later attempts force
-        # HTTP/1.1 - the known cure for a family of "RPC failed; curl 28 /
-        # early EOF" aborts that only bite the bulk pack stream while small
-        # requests sail through (observed on the test Mac, 2026-07-18).
-        $HttpMode = if ($Attempt -gt 1) { @('-c', 'http.version=HTTP/1.1') } else { @() }
-        & git @GitNetOpts @HttpMode clone $GitVerbosity --depth 1 --branch $Branch $RepoUrl $InstallDir
-        if ($LASTEXITCODE -eq 0) { return $true }
-        try { Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop } catch {}
-        if ($Attempt -ge 3) {
-            Write-Note 'git could not finish the download on this network (3 attempts).'
-            return $false
-        }
-        $Attempt++
-        Write-Note "connection dropped mid-download - retrying ($Attempt/3, compatibility transfer mode) ..."
-        Start-Sleep -Seconds 3
-    }
+$InstallerPy = Join-Path $InstallDir 'install\installer.py'
+if (-not (Test-Path $InstallerPy)) {
+    Write-Err "installer.py not found at $InstallerPy."
+    Write-Note 'Make sure you run this script from inside the repository directory.'
+    exit 1
 }
-
-# Last-resort transport when git cannot get the pack through AT ALL: a plain
-# HTTPS archive download. The release asset (uploaded per release) supports
-# HTTP ranges, so curl -C - RESUMES after every disconnect - even a crawling
-# connection eventually finishes, which a restarted git clone never does.
-# Falls back to the branch snapshot (codeload, not resumable) when no release
-# asset is reachable. The tree lands WITHOUT .git metadata; the next installer
-# run detects that and repairs it in place (salvage path), so updates keep
-# working. Windows 10+ ships both curl.exe and tar.exe.
-function Invoke-TarballFallback {
-    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { return $false }
-    if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) { return $false }
-    if ($RepoUrl -notmatch 'github\.com/') { return $false }
-    $RepoPath = ($RepoUrl -split 'github\.com/', 2)[1] -replace '\.git$', ''
-    $AssetUrl = "https://github.com/$RepoPath/releases/latest/download/personal-chappie-src.tar.gz"
-    $SnapshotUrl = "https://codeload.github.com/$RepoPath/tar.gz/refs/heads/$Branch"
-    if ($env:CHAPPIE_PAYLOAD_COMMIT) {
-        # A verified install is pinned to ONE signed commit; the "latest"
-        # release asset cannot honor that pin, so go straight to the
-        # commit-addressed snapshot - the URL itself names the exact tree.
-        $AssetUrl = ''
-        $SnapshotUrl = "https://codeload.github.com/$RepoPath/tar.gz/$($env:CHAPPIE_PAYLOAD_COMMIT)"
-    }
-    $Tmp = "$InstallDir.payload.tar.gz"
-    Write-Note 'git transfer keeps stalling on this network - switching to a resumable archive download'
-    $Got = $false
-    $Try = 1
-    while ($AssetUrl -and $Try -le 8) {
-        & curl.exe -fL --speed-limit 1024 --speed-time 60 -C - -o $Tmp $AssetUrl
-        if ($LASTEXITCODE -eq 0) { $Got = $true; break }
-        if ($LASTEXITCODE -eq 22) { break }  # HTTP error (e.g. asset missing): not retryable
-        Write-Note "archive download interrupted - resuming where it stopped ($Try/8) ..."
-        $Try++
-        Start-Sleep -Seconds 3
-    }
-    if (-not $Got) {
-        try { Remove-Item -LiteralPath $Tmp -Force -ErrorAction Stop } catch {}
-        Write-Note 'no resumable release archive reachable - trying the direct snapshot (single stream)'
-        & curl.exe -fL --speed-limit 1024 --speed-time 60 -o $Tmp $SnapshotUrl
-        if ($LASTEXITCODE -ne 0) {
-            try { Remove-Item -LiteralPath $Tmp -Force -ErrorAction Stop } catch {}
-            return $false
-        }
-    }
-    try { Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop } catch {}
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    & tar.exe -xzf $Tmp -C $InstallDir --strip-components=1
-    $TarOk = ($LASTEXITCODE -eq 0)
-    try { Remove-Item -LiteralPath $Tmp -Force -ErrorAction Stop } catch {}
-    if (-not $TarOk) { return $false }
-    Write-Note 'installed from the release archive (git metadata is repaired on a future update)'
-    return $true
-}
-
-function Invoke-FetchPayload {
-    if (Invoke-CloneWithRetry) { return $true }
-    if (Invoke-TarballFallback) { return $true }
-    Write-Err 'the download kept failing (connection dropped mid-transfer).'
-    Write-Note 'Check your internet connection (Wi-Fi, VPN, proxy), then re-run the'
-    Write-Note 'installer - it is safe to re-run and picks up where it makes sense.'
-    return $false
-}
-
-# Self-heal a broken install dir (leftover non-git folder from an earlier or
-# aborted install, or a checkout whose git state no longer updates): keep the
-# old tree as a timestamped sibling backup - never delete - clone fresh, then
-# carry the user's local state (data/, chappie.toml, .env) into the new
-# checkout. A stale folder must never require manual cleanup to install.
-function Invoke-SalvageReclone {
-    $StaleBackup = "$InstallDir.stale-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    try {
-        Move-Item -LiteralPath $InstallDir -Destination $StaleBackup -ErrorAction Stop
-    } catch {
-        Write-Err "cannot move the broken install dir aside ($InstallDir -> $StaleBackup)."
-        Write-Note 'Close any program using that folder (or move it yourself), then re-run.'
-        exit 1
-    }
-    Write-Note "moved the old directory to $StaleBackup (nothing was deleted)"
-    if (-not (Invoke-FetchPayload)) { exit 1 }
-    # Everything a user can lose: config, credentials file-fallback + DBs
-    # (inside data/), the dotenv, AND the wiki vault (its absence from this
-    # list is what destroyed a user's wiki pages on 2026-07-20). A failed
-    # copy is a loud warning pointing at the backup dir - never silent.
-    # NOTE: a "skip when the destination exists" guard is WRONG for wiki -
-    # the fresh clone ships a tracked seed wiki/ skeleton, so the guard
-    # would silently never restore the user's real vault. Directories that
-    # exist on both sides are overlay-MERGED (user files win over seed).
-    foreach ($Item in @('data', $ConfigFileName, '.env', 'wiki')) {
-        $Old = Join-Path $StaleBackup $Item
-        $New = Join-Path $InstallDir $Item
-        if (-not (Test-Path $Old)) { continue }
-        if (-not (Test-Path $New)) {
-            try {
-                Copy-Item -LiteralPath $Old -Destination $New -Recurse -ErrorAction Stop
-                Write-Note "kept your $Item from the previous install"
-            } catch {
-                Write-Err "could NOT carry over $Item - it is still safe in $Old; copy it back manually."
-            }
-        } elseif ((Test-Path $Old -PathType Container) -and (Test-Path $New -PathType Container)) {
-            try {
-                Copy-Item -Path (Join-Path $Old '*') -Destination $New -Recurse -Force -ErrorAction Stop
-                Write-Note "merged your $Item from the previous install over the fresh seed"
-            } catch {
-                Write-Err "could NOT merge $Item - it is still safe in $Old; copy it back manually."
-            }
-        }
-    }
-    Write-Ok 'reinstalled fresh (previous state preserved in the backup dir)'
-}
-
-if (Test-Path (Join-Path $InstallDir '.git')) {
-    $UpdateOk = $true
-    Push-Location $InstallDir
-    try {
-        & git @GitNetOpts fetch $GitVerbosity --depth 1 origin $Branch
-        if ($LASTEXITCODE -ne 0) { $UpdateOk = $false }
-        if ($UpdateOk) {
-            & git checkout --quiet $Branch
-            if ($LASTEXITCODE -ne 0) { $UpdateOk = $false }
-        }
-        if ($UpdateOk) {
-            & git reset --quiet --hard "origin/$Branch"
-            if ($LASTEXITCODE -ne 0) { $UpdateOk = $false }
-        }
-    } finally {
-        Pop-Location
-    }
-    if ($UpdateOk) {
-        Write-Ok 'updated existing checkout to latest'
-    } else {
-        Write-Note 'existing checkout would not update (broken git state) - reinstalling in place.'
-        Invoke-SalvageReclone
-    }
-} else {
-    if (Test-Path $InstallDir) {
-        Write-Note "$InstallDir exists but is not a git repo (leftover from an earlier install) - reinstalling in place."
-        Invoke-SalvageReclone
-    } else {
-        if (-not (Invoke-FetchPayload)) { exit 1 }
-        Write-Ok 'downloaded'
-    }
-}
-
-# WAVE 5 - payload-commit pin (axis E, Wave-5 audit Finding 2).
-#
-# install-verify.ps1 sets $env:CHAPPIE_PAYLOAD_COMMIT containing the
-# signed payload commit SHA (Wave 1+2+4-authenticated). If set, bind the
-# cloned tree to that exact commit so an attacker who flips `main` post-
-# release cannot influence what we install. The signed SHA may be 40-char
-# (git SHA-1) or 64-char (git SHA-256 repos).
-if ($env:CHAPPIE_PAYLOAD_COMMIT) {
-    $PayloadCommit = $env:CHAPPIE_PAYLOAD_COMMIT
-    if ($PayloadCommit -notmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') {
-        Write-Err "CHAPPIE_PAYLOAD_COMMIT is not a well-formed git SHA: '$PayloadCommit' - refusing."
-        exit 1
-    }
-    if (-not (Test-Path (Join-Path $InstallDir '.git'))) {
-        # Tarball-fallback install: the tree was fetched from the commit-
-        # addressed archive URL, so the pin is embedded in the download
-        # itself; there are no git objects to re-verify against.
-        Write-Ok "pinned via commit-addressed archive ($($PayloadCommit.Substring(0,12)))"
-        $PinnedViaArchive = $true
-    } else {
-        $PinnedViaArchive = $false
-    }
-    if (-not $PinnedViaArchive) {
-    Push-Location $InstallDir
-    try {
-        # Shallow clones don't carry full history; deepen to retrieve the
-        # target SHA explicitly. github.com defaults allow fetching arbitrary
-        # SHAs on most repos; fall back to unshallow if direct-SHA fetch
-        # fails (e.g. tag pushed but workflow ref-name was the merge commit).
-        & git fetch --quiet --depth 1 origin $PayloadCommit 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            & git fetch --quiet --unshallow origin
-            if ($LASTEXITCODE -ne 0) { & git fetch --quiet origin }
-        }
-        & git checkout --quiet --detach $PayloadCommit
-        if ($LASTEXITCODE -ne 0) {
-            Write-Err "failed to checkout payload-commit $PayloadCommit - refusing."
-            Write-Note 'the cloned tree does not contain the signed commit; release may be inconsistent.'
-            exit 1
-        }
-        # Defensive verify: HEAD must be exactly the signed SHA byte-for-byte.
-        $ActualHead = (& git rev-parse HEAD).Trim()
-        if ($ActualHead -ne $PayloadCommit) {
-            Write-Err "HEAD drift detected: pinned=$PayloadCommit, actual=$ActualHead - refusing."
-            exit 1
-        }
-        Write-Ok "pinned to signed commit $($PayloadCommit.Substring(0,12))"
-    } finally {
-        Pop-Location
-    }
-    }
-}
+Write-Ok 'Local repository verified'
 
 # ----------------------------------------------------------------- venv + bootstrap deps
 Write-Phase '3/6' 'Python environment'
