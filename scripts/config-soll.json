@@ -102,7 +102,7 @@
     "model": "z-ai/glm-5.2"
   },
   "brain.providers.gemini-live": {
-    "model": "gemini-3.1-flash-live-preview",
+    "model": "gemini-3.8-live",
     "voice": "Fenrir"
   },
   "brain.providers.openai-realtime": {

@@ -333,7 +333,7 @@ def test_get_realtime_options_gemini_live_voices(monkeypatch):
         "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
         "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
     }
-    assert body["models"][0]["id"] == "gemini-3.1-flash-live-preview"
+    assert body["models"][0]["id"] == "gemini-3.8-live"
 
 
 def test_get_realtime_options_vertex_live_shares_the_gemini_voice_roster(monkeypatch):

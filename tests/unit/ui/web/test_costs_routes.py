@@ -37,7 +37,7 @@ def _seed(data_dir: Path) -> None:
     conn.executescript(_SCHEMA)
     rows = [
         ("t1", "sess-a", NOW_MS - 3_600_000, "realtime", "gemini-live",
-         "gemini-3.1-flash-live-preview", 40_000, 200, 0.40, "what is on my calendar"),
+         "gemini-3.8-live", 40_000, 200, 0.40, "what is on my calendar"),
         ("t2", "sess-b", NOW_MS - 7_200_000, "deep", "anthropic",
          "claude-opus-4-7-20251022", 2_000, 400, 0.09, "summarise the meeting"),
     ]
@@ -117,8 +117,8 @@ def test_entries_sort_and_paginate(client: TestClient) -> None:
 def test_pricing_lists_every_seen_model(client: TestClient) -> None:
     body = client.get("/api/costs/pricing?days=30").json()
     models = {row["model"] for row in body["rates"]}
-    assert models == {"gemini-3.1-flash-live-preview", "claude-opus-4-7-20251022"}
-    live = next(r for r in body["rates"] if r["model"] == "gemini-3.1-flash-live-preview")
+    assert models == {"gemini-3.8-live", "claude-opus-4-7-20251022"}
+    live = next(r for r in body["rates"] if r["model"] == "gemini-3.8-live")
     # The realtime model's audio rates are the whole point of the rate card.
     assert live["audio_input_usd_per_mtok"] is not None
     assert live["known"] is True
@@ -166,7 +166,7 @@ def _seed_two_days(data_dir: Path) -> None:
         ("d2", "sess-b", busy + 3_600_000, "fast", "anthropic",
          "claude-haiku-4-5-20251001", 5_000, 500, 0.01, "a quick question"),
         ("d3", "sess-c", quiet, "realtime", "gemini-live",
-         "gemini-3.1-flash-live-preview", 40_000, 200, 0.40, "the day before"),
+         "gemini-3.8-live", 40_000, 200, 0.40, "the day before"),
     ]
     conn.executemany(
         "INSERT INTO voice_turns (id, session_id, started_ms, tier, provider, model, "
@@ -230,7 +230,7 @@ def test_daily_narrows_with_the_same_filters(two_day_client: TestClient) -> None
     body = two_day_client.get("/api/costs/daily?days=30&provider=gemini-live").json()
     assert len(body["days"]) == 1
     assert [m["key"] for m in body["days"][0]["by_model"]] == [
-        "gemini-3.1-flash-live-preview"
+        "gemini-3.8-live"
     ]
 
 

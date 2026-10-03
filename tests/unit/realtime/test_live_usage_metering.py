@@ -224,7 +224,7 @@ async def test_publish_live_usage_prices_audio_and_resets() -> None:
             "input_audio": 1_000_000,
             "output_audio": 1_000_000,
         },
-        "gemini-3.1-flash-live-preview",
+        "gemini-3.8-live",
     )
     await session._publish_live_usage()
     events = session._bus.published
@@ -263,6 +263,6 @@ async def test_publish_live_usage_prices_the_vertex_live_default_model() -> None
 
 @pytest.mark.asyncio
 async def test_publish_live_usage_without_usage_is_silent() -> None:
-    session = _bare_session({}, "gemini-3.1-flash-live-preview")
+    session = _bare_session({}, "gemini-3.8-live")
     await session._publish_live_usage()
     assert session._bus.published == []

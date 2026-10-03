@@ -76,7 +76,7 @@ def _sessions_db(path: Path) -> None:
     conn.execute(
         "INSERT INTO voice_turns (id, session_id, started_ms, tier, provider, model, "
         "tokens_in, tokens_out, cost_usd, user_text) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ("turn-1", "sess-1", T0, "realtime", "gemini-live", "gemini-3.1-flash-live-preview",
+        ("turn-1", "sess-1", T0, "realtime", "gemini-live", "gemini-3.8-live",
          50_000, 300, 0.4, "what is on my calendar"),
     )
     # A classic pipeline turn with no event rows — the fallback path.
@@ -91,7 +91,7 @@ def _sessions_db(path: Path) -> None:
             "turn-1",
             {
                 "provider": "gemini-live",
-                "model": "gemini-3.1-flash-live-preview",
+                "model": "gemini-3.8-live",
                 "tokens_in": 50_000,
                 "tokens_out": 300,
                 "cost_usd": 0.4,

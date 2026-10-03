@@ -18,7 +18,7 @@ from uuid import uuid4
 
 log = logging.getLogger(__name__)
 
-_MODEL = "gemini-3.1-flash-live-preview"
+_MODEL = "gemini-3.8-live"
 _INPUT_RATE = 16_000
 _OUTPUT_RATE = 24_000
 

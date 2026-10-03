@@ -94,7 +94,7 @@ class TestPricingTable:
             "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
             "gemini-3.6-flash",
-            "gemini-3.1-flash-live-preview",
+            "gemini-3.8-live",
             "google/gemini-3.5-flash",
             "google/gemini-3.6-flash",
             "gpt-realtime-2.1",
@@ -119,7 +119,7 @@ class TestCalculateRealtimeCostUsd:
     def test_audio_rates_apply_for_live_model(self) -> None:
         # 1M audio in + 1M audio out at gemini live rates: 3.0 + 12.0
         cost = calculate_realtime_cost_usd(
-            "gemini-3.1-flash-live-preview", 0, 0, 1_000_000, 1_000_000
+            "gemini-3.8-live", 0, 0, 1_000_000, 1_000_000
         )
         assert cost == pytest.approx(15.0)
 
@@ -127,7 +127,7 @@ class TestCalculateRealtimeCostUsd:
         # text: (1000 * 0.75 + 500 * 4.50) / 1e6 = 0.003
         # audio: (2000 * 3.0 + 1000 * 12.0) / 1e6 = 0.018
         cost = calculate_realtime_cost_usd(
-            "gemini-3.1-flash-live-preview", 1000, 500, 2000, 1000
+            "gemini-3.8-live", 1000, 500, 2000, 1000
         )
         assert cost == pytest.approx(0.021)
 

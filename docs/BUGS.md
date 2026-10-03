@@ -7241,7 +7241,7 @@ during the death loop were never transcribed (the transport was already
 dead, and the committed-turn guard rightly refuses classic-voice replay).
 
 **Root cause — two API-contract violations in the seed, plus a blind
-guard.** Gemini 3.1 Live (`gemini-3.1-flash-live-preview`) accepts
+guard.** Gemini 3.1 Live (`gemini-3.8-live`) accepts
 `client_content` ONLY as *declared* initial history: (1) the connect config
 must set `history_config.initial_history_in_client_content=True`, and
 (2) the server processes `client_content` until one arrives with

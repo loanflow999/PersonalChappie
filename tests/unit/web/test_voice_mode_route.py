@@ -161,7 +161,7 @@ def test_get_voice_mode_cross_family_gemini_only(monkeypatch):
     assert body["realtime_available"] is True
     assert body["active_provider"] == "gemini-live"
     assert body["active_provider_label"] == "Gemini Live"
-    assert body["active_model"] == "gemini-3.1-flash-live-preview"
+    assert body["active_model"] == "gemini-3.8-live"
 
 
 def test_get_voice_mode_reports_pinned_realtime_model(monkeypatch):

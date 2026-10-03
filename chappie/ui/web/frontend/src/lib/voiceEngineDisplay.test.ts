@@ -76,7 +76,7 @@ describe("resolveVoiceEngineDisplay", () => {
         mode: "realtime",
         activeProvider: "gemini-live",
         activeProviderLabel: "Gemini Live",
-        activeModel: "gemini-3.1-flash-live-preview",
+        activeModel: "gemini-3.8-live",
       }).providerLabel,
     ).toBe("Gemini Live");
     expect(

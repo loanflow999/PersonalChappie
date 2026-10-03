@@ -2,7 +2,7 @@
 
 **Status:** draft for maintainer review — analysis verified, fix not yet implemented.
 **Session:** `364fce33-0613-4a73-bd32-db8e85b9a18a`, 2026-07-17 15:11:16–15:12:12, desktop realtime,
-provider `gemini-live`, model `gemini-3.1-flash-live-preview`, tool mode `delegate`, 2 turns, ended by hotkey.
+provider `gemini-live`, model `gemini-3.8-live`, tool mode `delegate`, 2 turns, ended by hotkey.
 **Evidence sources:** `data/chappie_desktop.log`, `data/sessions.db` (`voice_turns`, `voice_events`),
 `data/flight_recorder/2026-07-17.jsonl`.
 

@@ -88,7 +88,7 @@ These probes do not replace long-call or native-device qualification.
 Run `python scripts/verify_gpt_live.py --run-live` for the opt-in OpenAI synthetic
 probe. The test uses configured credentials and incurs normal API usage; it
 captures neither microphone nor screen data. Gemini is selectable with
-`--provider gemini --model gemini-3.1-flash-live-preview`.
+`--provider gemini --model gemini-3.8-live`.
 Add `--reconnect` to verify recovery after a forced connection loss.
 
 The architecture decision and remaining acceptance requirements are recorded in

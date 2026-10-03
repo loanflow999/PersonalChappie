@@ -5,9 +5,9 @@ import argparse
 import gc
 
 REPLACEMENTS = [
-    ("jarvis", "chappie"),
+    ("chappie", "chappie"),
     ("Jarvis", "Chappie"),
-    ("JARVIS", "CHAPPIE"),
+    ("CHAPPIE", "CHAPPIE"),
 ]
 
 EXCLUDE_DIRS = {
@@ -82,10 +82,10 @@ def safe_rename(old_path: str, new_path: str, max_retries: int = 5, delay: float
                 raise e
 
 def main():
-    parser = argparse.ArgumentParser(description="Replace jarvis with chappie maintaining case.")
+    parser = argparse.ArgumentParser(description="Replace chappie with chappie maintaining case.")
     parser.add_argument("--apply", action="store_true", help="Apply changes (default asks or dry-run)")
     parser.add_argument("--dry-run", action="store_true", help="Dry run without modifying files")
-    parser.add_argument("--rename-root", action="store_true", help="Also rename the root directory if it contains jarvis")
+    parser.add_argument("--rename-root", action="store_true", help="Also rename the root directory if it contains chappie")
     args = parser.parse_args()
 
     if args.dry_run:
@@ -107,7 +107,7 @@ def main():
     self_script = os.path.abspath(__file__)
 
     print("=" * 60)
-    print("REEMPLAZO RECURSIVO: jarvis -> chappie (respetando mayúsculas)")
+    print("REEMPLAZO RECURSIVO: chappie -> chappie (respetando mayúsculas)")
     print(f"Modo: {'APLICAR CAMBIOS' if apply_changes else 'SIMULACIÓN (DRY-RUN)'}")
     print(f"Raíz: {root_dir}")
     print("=" * 60)
@@ -221,7 +221,7 @@ def main():
 
     print(f"Fase 3 completada: {renamed_dirs} carpetas {'renombradas' if apply_changes else 'detectadas para renombrar'}.")
 
-    # Opción de renombrar la carpeta raíz del proyecto si tiene jarvis en el nombre
+    # Opción de renombrar la carpeta raíz del proyecto si tiene chappie en el nombre
     root_base = os.path.basename(root_dir)
     new_root_base, root_count = replace_in_string(root_base)
     if root_count > 0:

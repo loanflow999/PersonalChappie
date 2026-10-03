@@ -111,7 +111,7 @@ async def test_realtime_session_voice_fills_a_blank_turn(tmp_path) -> None:
                 chappie_text="Servus!",  # i18n-allow: German voice fixture
                 tier="realtime",
                 provider="gemini-live",
-                model="gemini-3.1-flash-live-preview",
+                model="gemini-3.8-live",
                 voice="Fenrir",
                 voice_provider="gemini-live",
             )

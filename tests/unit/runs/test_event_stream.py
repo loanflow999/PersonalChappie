@@ -136,7 +136,7 @@ def test_realtime_turn_gets_a_decision_path_instead_of_nothing():
     build_decision_path returned [] for the default voice mode."""
     steps = analyzer.build_decision_path([
         _ev("RealtimeSessionReady", ts=1, provider="gemini-live",
-            model="gemini-3.1-flash-live-preview", surface="desktop"),
+            model="gemini-3.8-live", surface="desktop"),
         _ev("LatencySpan", ts=2, phase="realtime_routing_decision", duration_ms=41.0),
     ])
     kinds = [s.kind for s in steps]
@@ -158,7 +158,7 @@ def test_explicit_provider_switch_becomes_a_fallback_step():
 
 def test_ensure_brain_step_falls_back_to_the_turn_aggregate():
     turn = RunTurn(idx=0, trace_id="t1", provider="gemini-live",
-                   model="gemini-3.1-flash-live-preview", tier="realtime")
+                   model="gemini-3.8-live", tier="realtime")
     steps = analyzer.ensure_brain_step([], turn)
     assert steps[0].kind == "brain"
     assert "gemini-live" in steps[0].rationale

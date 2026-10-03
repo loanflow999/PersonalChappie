@@ -172,7 +172,7 @@ class TestParseModelsResponse:
                     "supportedGenerationMethods": ["predictLongRunning"],
                 },
                 {
-                    "name": "models/gemini-3.1-flash-live-preview",
+                    "name": "models/gemini-3.8-live",
                     "supportedGenerationMethods": ["bidiGenerateContent"],
                 },
             ]
@@ -818,7 +818,7 @@ class TestRealtimeCatalog:
 
         ids = [m.id for m in REALTIME_MODELS["gemini-live"]]
         # Matches _MODEL in chappie/plugins/realtime/gemini_live.py.
-        assert ids[0] == "gemini-3.1-flash-live-preview"
+        assert ids[0] == "gemini-3.8-live"
         assert len(ids) == len(set(ids))
 
     def test_vertex_live_models_lead_with_the_hardcoded_default(self) -> None:

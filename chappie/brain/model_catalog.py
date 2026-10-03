@@ -575,14 +575,14 @@ REALTIME_MODELS: dict[str, list[ModelInfo]] = {
         ]
     ),
     # gemini-live — verified 2026-07-10 against ai.google.dev/gemini-api/docs/models
-    # (the Live API model list). ``gemini-3.1-flash-live-preview`` is the current
+    # (the Live API model list). ``gemini-3.8-live`` is the current
     # flagship (matches ``_MODEL`` in ``chappie/plugins/realtime/gemini_live.py``);
     # ``gemini-2.5-flash-native-audio-preview-12-2025`` is the current 2.5-series
     # native-audio sibling still listed on that page. The older
     # ``gemini-2.0-flash-live-preview`` family is marked for shutdown — omitted.
     "gemini-live": _curated(
         [
-            ("gemini-3.1-flash-live-preview", "Gemini 3.1 Flash Live (default)"),
+            ("gemini-3.8-live", "Gemini 3.8 Live (default)"),
             (
                 "gemini-2.5-flash-native-audio-latest",
                 "Gemini 2.5 Flash Native Audio (latest alias)",

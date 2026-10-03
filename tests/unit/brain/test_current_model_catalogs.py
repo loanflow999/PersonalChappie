@@ -150,7 +150,7 @@ def test_current_realtime_models_and_voices() -> None:
         "cedar",
     }
     assert {
-        "gemini-3.1-flash-live-preview",
+        "gemini-3.8-live",
         "gemini-2.5-flash-native-audio-latest",
         "gemini-2.5-flash-native-audio-preview-12-2025",
     } == _ids(REALTIME_MODELS["gemini-live"])

@@ -106,7 +106,7 @@ PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     "gemini-3.8-flash": (0.75, 3.75),  # OpenRouter feed, 2026-09-28
     # Live API models — TEXT rates; audio rates live in
     # REALTIME_AUDIO_PRICING_USD_PER_MTOK below.
-    "gemini-3.1-flash-live-preview": (0.75, 4.50),
+    "gemini-3.8-live": (0.75, 4.50),
     # 2.5 Flash native-audio Live: $0.50 / $2.00 text (ai.google.dev pricing,
     # 2026-08-18). ``gemini-live-2.5-flash-native-audio`` is the Vertex id of
     # the same model — VertexLiveProvider.default_model — and Vertex bills
@@ -445,11 +445,11 @@ async def ensure_pricing_for(model: str | None, *, timeout_s: float = 3.0) -> bo
 # Audio tokens are billed 4-40x above the same model's text tokens, so
 # realtime cost accounting that prices everything at text rates
 # understates the bill dramatically. Sources (2026-07-28):
-# - Google Live API: gemini-3.1-flash-live-preview $3.00 in / $12.00 out
+# - Google Live API: gemini-3.8-live $3.00 in / $12.00 out
 # - OpenAI Realtime: gpt-realtime-2.1 $32 in / $64 out,
 #   gpt-realtime-2.1-mini $10 in / $20 out
 REALTIME_AUDIO_PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
-    "gemini-3.1-flash-live-preview": (3.0, 12.0),
+    "gemini-3.8-live": (3.0, 12.0),
     # 2.5 Flash native audio (AI Studio id + Vertex id): $3.00 in / $12.00
     # out per ai.google.dev/gemini-api/docs/pricing, 2026-08-18.
     "gemini-2.5-flash-native-audio-preview-12-2025": (3.0, 12.0),
